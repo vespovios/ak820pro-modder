@@ -247,11 +247,12 @@ fn cmd_list(json: bool) -> Result<()> {
     println!("Found {} interface(s):", devices.len());
     for d in devices {
         println!(
-            "  iface={} usage_page=0x{:04x} usage=0x{:04x}  pid=0x{:04x}  {}  {}",
+            "  iface={} usage_page=0x{:04x} usage=0x{:04x}  pid=0x{:04x} release=0x{:04x}  {}  {}",
             d.interface,
             d.usage_page,
             d.usage,
             d.pid,
+            d.release_number,
             d.product.as_deref().unwrap_or("?"),
             d.path,
         );

@@ -25,10 +25,67 @@ pub struct DeviceInfo {
     pub interface: i32,
     pub usage_page: u16,
     pub usage: u16,
+    /// USB `bcdDevice`. On the AK820 Pro this tracks the firmware
+    /// revision (e.g. `0x0107` for 1.07, `0x0114` for 1.14), which lets
+    /// bug reports identify the firmware even when no control command
+    /// gets a response.
+    pub release_number: u16,
     pub manufacturer: Option<String>,
     pub product: Option<String>,
     pub serial: Option<String>,
     pub path: String,
+}
+
+/// Usage pages the official AJAZZ driver accepts for the control
+/// collection (`q(x)` in the web-driver source), in priority order. On
+/// the AK820 Pro that's interface 2 (`0xFF68`), not interface 3 (`0xFF67`).
+pub const CONTROL_USAGE_PAGES: &[u16] = &[0xFF68, 0xFF80, 0xFF60, 0xFF00, 0xFF01, 0xFF1B];
+
+/// Usage page of the feature-report interface that newer AK820 Pro
+/// revisions (e.g. ANSI boards on firmware 1.14) expose instead of the
+/// `0xFF67` TFT collection. Those boards don't answer the `0xAA`-framed
+/// protocol this crate speaks.
+const FEATURE_REPORT_USAGE_PAGE: u16 = 0xFF13;
+
+/// Usage page of the TFT upload collection on the boards we support.
+const TFT_USAGE_PAGE: u16 = 0xFF67;
+
+/// Pick the control endpoint from an enumeration. Selection precedence:
+///   1. `AK820_IFACE=N` → first device with `interface_number == N`
+///   2. `AK820_USAGE_PAGE=0xFFXX` → first device with that usage page
+///   3. the first usage page of [`CONTROL_USAGE_PAGES`] that any candidate
+///      exposes, then [`CONTROL_INTERFACE`] as a last resort
+///
+/// Rule 3 walks the priority list, not the enumeration order: macOS
+/// doesn't guarantee the order in which it reports a device's interfaces.
+pub fn select_control(candidates: &[DeviceInfo]) -> Option<&DeviceInfo> {
+    let by_iface_env = std::env::var("AK820_IFACE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok());
+    let by_usage_env = std::env::var("AK820_USAGE_PAGE")
+        .ok()
+        .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+
+    if let Some(want) = by_iface_env {
+        return candidates.iter().find(|d| d.interface == want);
+    }
+    if let Some(want) = by_usage_env {
+        return candidates.iter().find(|d| d.usage_page == want);
+    }
+    CONTROL_USAGE_PAGES
+        .iter()
+        .find_map(|page| candidates.iter().find(|d| d.usage_page == *page))
+        .or_else(|| candidates.iter().find(|d| d.interface == CONTROL_INTERFACE))
+}
+
+/// `true` when the enumeration looks like a board revision that speaks
+/// the feature-report protocol instead of ours: it exposes `0xFF13` but
+/// no `0xFF67` TFT collection.
+fn looks_like_feature_report_board(candidates: &[DeviceInfo]) -> bool {
+    candidates
+        .iter()
+        .any(|d| d.usage_page == FEATURE_REPORT_USAGE_PAGE)
+        && !candidates.iter().any(|d| d.usage_page == TFT_USAGE_PAGE)
 }
 
 /// Summary of one HID interface's report-descriptor properties.
@@ -159,6 +216,7 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
             interface: d.interface_number(),
             usage_page: d.usage_page(),
             usage: d.usage(),
+            release_number: d.release_number(),
             manufacturer: d.manufacturer_string().map(str::to_owned),
             product: d.product_string().map(str::to_owned),
             serial: d.serial_number().map(str::to_owned),
@@ -174,44 +232,23 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
 pub struct Connection {
     device: HidDevice,
     info: DeviceInfo,
+    /// Set when the enumeration matched [`looks_like_feature_report_board`].
+    /// Only used to turn a bare response timeout into an actionable error.
+    feature_report_board: bool,
 }
 
 impl Connection {
-    /// Open the AK820 control endpoint. Selection precedence:
-    ///   1. `AK820_IFACE=N` → first device with `interface_number == N`
-    ///   2. `AK820_USAGE_PAGE=0xFFXX` → first device with that usage page
-    ///   3. default: vendor-specific usage page `0xFF67`
+    /// Open the AK820 control endpoint. See [`select_control`] for the
+    /// selection rules.
     pub fn open_control() -> Result<Self> {
         let candidates = enumerate()?;
-
-        let by_iface_env = std::env::var("AK820_IFACE")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok());
-        let by_usage_env = std::env::var("AK820_USAGE_PAGE")
-            .ok()
-            .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok());
-
-        // The official AJAZZ online driver filters collections by usage page —
-        // `q(x)` in the source accepts [0xFF68, 0xFF80, 0xFF60, 0xFF00, 0xFF01, 0xFF1B].
-        // On the AK820 Pro that's interface 2 (0xFF68), not interface 3 (0xFF67).
-        const PREFERRED_USAGE_PAGES: &[u16] = &[0xFF68, 0xFF80, 0xFF60, 0xFF00, 0xFF01, 0xFF1B];
-
-        let pick = if let Some(want) = by_iface_env {
-            candidates.iter().find(|d| d.interface == want).cloned()
-        } else if let Some(want) = by_usage_env {
-            candidates.iter().find(|d| d.usage_page == want).cloned()
-        } else {
-            candidates
-                .iter()
-                .find(|d| PREFERRED_USAGE_PAGES.contains(&d.usage_page))
-                .or_else(|| candidates.iter().find(|d| d.interface == CONTROL_INTERFACE))
-                .cloned()
-        };
-
-        let control = pick.ok_or(Error::DeviceNotFound {
-            vid: VENDOR_ID,
-            interface: CONTROL_INTERFACE,
-        })?;
+        let control = select_control(&candidates)
+            .cloned()
+            .ok_or(Error::DeviceNotFound {
+                vid: VENDOR_ID,
+                interface: CONTROL_INTERFACE,
+            })?;
+        let feature_report_board = looks_like_feature_report_board(&candidates);
 
         let api = HidApi::new()?;
         let device = api.open_path(&std::ffi::CString::new(control.path.clone()).unwrap())?;
@@ -220,11 +257,14 @@ impl Connection {
             path = %control.path,
             interface = control.interface,
             usage_page = format!("0x{:04x}", control.usage_page),
+            release = format!("0x{:04x}", control.release_number),
+            feature_report_board,
             "opened control interface"
         );
         Ok(Self {
             device,
             info: control,
+            feature_report_board,
         })
     }
 
@@ -267,10 +307,7 @@ impl Connection {
                 .as_millis()
                 .min(i32::MAX as u128) as i32;
             if remaining_ms == 0 {
-                return Err(Error::UnexpectedResponse(format!(
-                    "timeout waiting for cmd 0x{:02x}",
-                    expected_cmd,
-                )));
+                return Err(self.timeout_error(expected_cmd));
             }
             let n = self.device.read_timeout(&mut buf, remaining_ms)?;
             if n == 0 {
@@ -286,6 +323,25 @@ impl Connection {
             }
             return Ok(buf[HEADER_LEN..n.min(PACKET_LEN)].to_vec());
         }
+    }
+
+    /// Build the error for a response that never arrived. Names the
+    /// interface we talked to, so a bug report alone shows whether the
+    /// wrong endpoint was picked, and flags board revisions that speak a
+    /// different protocol.
+    fn timeout_error(&self, expected_cmd: u8) -> Error {
+        let mut msg = format!(
+            "timeout waiting for cmd 0x{:02x} (interface {}, usage page 0x{:04x}, release 0x{:04x})",
+            expected_cmd, self.info.interface, self.info.usage_page, self.info.release_number,
+        );
+        if self.feature_report_board {
+            msg.push_str(
+                ". This keyboard exposes the 0xFF13 feature-report interface used by newer \
+                 AK820 Pro revisions (e.g. firmware 1.14), which speak a protocol this app \
+                 doesn't support yet",
+            );
+        }
+        Error::UnexpectedResponse(msg)
     }
 
     /// Run a single-chunk GET transaction: send request header, await response,
@@ -572,7 +628,7 @@ impl Connection {
         let want_usage_page = std::env::var("AK820_TFT_USAGE_PAGE")
             .ok()
             .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(0xFF67);
+            .unwrap_or(TFT_USAGE_PAGE);
         let pick = candidates
             .iter()
             .find(|d| d.usage_page == want_usage_page)
@@ -590,7 +646,11 @@ impl Connection {
             usage_page = format!("0x{:04x}", pick.usage_page),
             "opened TFT upload interface"
         );
-        Ok(Self { device, info: pick })
+        Ok(Self {
+            device,
+            info: pick,
+            feature_report_board: false,
+        })
     }
 
     /// Upload a TFT animation as a single chunked transaction. Re-uses our
@@ -705,4 +765,62 @@ pub struct ProbeReport {
     pub interface: i32,
     pub product: Option<String>,
     pub firmware_version: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn iface(interface: i32, usage_page: u16) -> DeviceInfo {
+        DeviceInfo {
+            vid: VENDOR_ID,
+            pid: 0x8009,
+            interface,
+            usage_page,
+            usage: 1,
+            release_number: 0x0107,
+            manufacturer: None,
+            product: None,
+            serial: None,
+            path: format!("iface{interface}-{usage_page:04x}"),
+        }
+    }
+
+    #[test]
+    fn select_control_follows_priority_not_enumeration_order() {
+        // 0xFF00 is enumerated first, but 0xFF68 ranks higher.
+        let candidates = [iface(0, 0xFF00), iface(3, 0xFF67), iface(2, 0xFF68)];
+        let pick = select_control(&candidates).expect("control endpoint");
+        assert_eq!(pick.usage_page, 0xFF68);
+        assert_eq!(pick.interface, 2);
+    }
+
+    #[test]
+    fn select_control_falls_back_to_control_interface() {
+        let candidates = [iface(1, 0x0001), iface(3, 0xFF67), iface(2, 0x000C)];
+        let pick = select_control(&candidates).expect("fallback endpoint");
+        assert_eq!(pick.interface, CONTROL_INTERFACE);
+    }
+
+    #[test]
+    fn select_control_returns_none_without_candidates() {
+        assert!(select_control(&[]).is_none());
+    }
+
+    #[test]
+    fn feature_report_board_needs_ff13_without_ff67() {
+        assert!(looks_like_feature_report_board(&[
+            iface(2, 0xFF68),
+            iface(3, 0xFF13),
+        ]));
+        assert!(!looks_like_feature_report_board(&[
+            iface(2, 0xFF68),
+            iface(3, 0xFF67),
+        ]));
+        assert!(!looks_like_feature_report_board(&[
+            iface(2, 0xFF68),
+            iface(3, 0xFF13),
+            iface(4, 0xFF67),
+        ]));
+    }
 }

@@ -231,29 +231,25 @@ fn list_devices() -> Result<Vec<DeviceInfo>, AppError> {
 /// Read-only liveness probe. Crucially does NOT touch the cached HID handle
 /// in `ConnState` — enumeration is cheap, and locking the mutex from a polling
 /// loop would block view-level operations (lighting set / system reads).
+/// Uses the same endpoint selection as `Connection::open_control`, so
+/// "connected" always refers to the interface the next command will open.
 #[tauri::command]
 fn probe_device() -> Result<ProbeReport, AppError> {
-    const CONTROL_USAGE_PAGE: u16 = 0xFF68;
     let candidates = ak820_protocol::enumerate()?;
-    Ok(
-        match candidates
-            .iter()
-            .find(|d| d.usage_page == CONTROL_USAGE_PAGE)
-        {
-            Some(d) => ProbeReport {
-                connected: true,
-                interface: d.interface,
-                product: d.product.clone(),
-                firmware_version: None,
-            },
-            None => ProbeReport {
-                connected: false,
-                interface: -1,
-                product: None,
-                firmware_version: None,
-            },
+    Ok(match ak820_protocol::select_control(&candidates) {
+        Some(d) => ProbeReport {
+            connected: true,
+            interface: d.interface,
+            product: d.product.clone(),
+            firmware_version: None,
         },
-    )
+        None => ProbeReport {
+            connected: false,
+            interface: -1,
+            product: None,
+            firmware_version: None,
+        },
+    })
 }
 
 #[tauri::command]
@@ -1064,10 +1060,7 @@ async fn apply_tft_image(
 }
 
 #[tauri::command]
-async fn apply_tft_preset(
-    memory: State<'_, Arc<TftMemory>>,
-    id: String,
-) -> Result<(), AppError> {
+async fn apply_tft_preset(memory: State<'_, Arc<TftMemory>>, id: String) -> Result<(), AppError> {
     // Build the animation off-thread — pixel generation for the busier
     // presets (scanline, checkerboard) does a ~half-megabyte of allocation
     // and we don't want to block the tokio worker on that.
@@ -1120,9 +1113,7 @@ async fn now_playing_tft_start(
 }
 
 #[tauri::command]
-async fn now_playing_tft_stop(
-    state: State<'_, Arc<NowPlayingTftState>>,
-) -> Result<(), AppError> {
+async fn now_playing_tft_stop(state: State<'_, Arc<NowPlayingTftState>>) -> Result<(), AppError> {
     state.stop().await;
     Ok(())
 }
