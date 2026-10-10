@@ -8,9 +8,10 @@ Living document. Every decoded command lands here with byte layout, semantics, a
 - **VID `0x0C45`** (Sonix Technology Co. Ltd.) — confirmed against the live device on macOS 2026-05-13. Earlier upstream notes that listed `0x8009` as the VID had it swapped with the PID.
 - Known PIDs:
   - `0x8009` — wired and 2.4 GHz dongle modes (shares HID stack)
+  - `0x800A`: alternate wired revision (listed as "AK820" in the AJAZZ device config; not hardware-verified by us)
   - `0xFEFE` — Bluetooth 5.1 mode (separate HID stack, surfaces only when the BT side is paired and active)
   - `0x7140` — ISP/bootloader mode (hidden pins under spacebar; do not poke without intent)
-- Live enumeration on a wired AK820 Pro returns **9 HID interfaces**: 6× iface 1 (standard keyboard / consumer / system-control endpoints), 1× iface 2, 1× iface 3 (control), 1× iface 0.
+- Live enumeration on a wired AK820 Pro returns **9 HID interfaces**: 6× iface 1 (standard keyboard / consumer / system-control endpoints), 1× iface 2 (control, usage page `0xFF68`), 1× iface 3 (TFT upload, usage page `0xFF67`), 1× iface 0. Newer revisions (e.g. ANSI boards on firmware 1.14, `bcdDevice 0x0114`) reportedly expose a `0xFF13` feature-report interface instead of `0xFF67` and don't answer the `0xAA`-framed protocol below; see [#8](https://github.com/wsclx/ak820pro-modder/issues/8).
 - Report length: 64 bytes payload + 1 byte report ID (to be re-verified against captures).
 
 ## Known feature families
@@ -190,7 +191,7 @@ byte 7 = 0x06          //                       (6619136/4096) >> 8   = 0x06
 ```
 
 - **Chunk payload size**: read from `device.collections[0].outputReports[0].items[0].reportCount` (the HID descriptor field). Defaults to **4104 bytes** if the descriptor is unavailable → payload = 4104 − 8 (header) = **4096 bytes** per chunk.
-- The control interface we currently use (usage_page `0xFF68`) has a 64-byte report. The TFT path needs a different HID interface — likely one of the other 8 interfaces on the AK820 Pro exposes a bigger output-report definition.
+- The control interface (usage_page `0xFF68`) has a 64-byte report. The TFT path uses the `0xFF67` interface, whose descriptor advertises a 4104-byte output report (found via `ak820 hid-descriptors`).
 - The firmware acks each chunk with **cmd 65 (`SET_LED_USER_ANIMATION`)**, not 80. A response listener must filter on cmd 65 for these uploads.
 
 **Per-frame delay encoding**:
