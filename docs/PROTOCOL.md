@@ -193,6 +193,18 @@ byte 7 = 0x06          //                       (6619136/4096) >> 8   = 0x06
 - **Chunk payload size**: read from `device.collections[0].outputReports[0].items[0].reportCount` (the HID descriptor field). Defaults to **4104 bytes** if the descriptor is unavailable → payload = 4104 − 8 (header) = **4096 bytes** per chunk.
 - The control interface (usage_page `0xFF68`) has a 64-byte report. The TFT path uses the `0xFF67` interface, whose descriptor advertises a 4104-byte output report (found via `ak820 hid-descriptors`).
 - The firmware acks each chunk with **cmd 65 (`SET_LED_USER_ANIMATION`)**, not 80. A response listener must filter on cmd 65 for these uploads.
+- `upload_tft_animation` probes for that ack on the TFT handle after the first chunk (1 s). If it arrives, every chunk waits for its ack (1.5 s timeout); otherwise the remaining chunks are paced at `AK820_TFT_PACE_MS` (default 10 ms). Which path ran is reported in `TftUploadReport`; whether the ack shows up on `0xFF67` at all is not hardware-verified yet.
+- On stock firmware, **Fn + Delete** toggles the display page between the clock and the user animation (reported by several community tools). An upload that "doesn't show" may simply be on the other page.
+
+### TFT clock (`setTftDateTime`, cmd 52)
+
+The web driver sets the RTC behind the stock clock page with a 10-byte `SET_TEMPORARY_COMMAND_DATA` (52) payload on the control interface:
+
+```
+[0x5A, 0x01, 0x5A, year % 100, month, day, hour, minute, second, weekday]
+```
+
+Month is 1–12, weekday is Sunday = 0 … Saturday = 6. Newer board revisions use the feature-report transaction `04 18` → `04 28` → `00 01 5A YY MM DD hh mm ss 00 04 … AA 55` → `04 02` with the same date core. Implemented as `Connection::set_tft_datetime` / `ak820 tft sync-time`; not yet hardware-verified on firmware 1.07.
 
 **Per-frame delay encoding**:
 - `delay[i] * 5` means the source supplies an integer in 5-ms units. To replicate a GIF with 100 ms / frame, send `delay = 20` (because 20 × 5 = 100 ms). Max representable: 255 × 5 = 1 275 ms / frame.
