@@ -2,6 +2,7 @@ use hidapi::{HidApi, HidDevice};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, trace};
 
+use crate::commands::clock::TftDateTime;
 use crate::commands::keymap::{Keymap, KEYMAP_BYTES};
 use crate::commands::lighting::{self, LightingConfig};
 use crate::commands::macros::{
@@ -9,7 +10,7 @@ use crate::commands::macros::{
 };
 use crate::commands::per_key_rgb::{CustomLedMap, CUSTOM_LED_BYTES};
 use crate::commands::system::{DeviceInfoReport, GameMode};
-use crate::commands::tft::{build_tft_header, TftAnimation};
+use crate::commands::tft::{build_tft_header, TftAnimation, TftUploadReport};
 use crate::protocol::{
     build_frame, cmd, HEADER_LEN, MAGIC_INCOMING, PACKET_LEN, PAYLOAD_PER_PACKET, REPORT_ID,
 };
@@ -86,6 +87,63 @@ fn looks_like_feature_report_board(candidates: &[DeviceInfo]) -> bool {
         .iter()
         .any(|d| d.usage_page == FEATURE_REPORT_USAGE_PAGE)
         && !candidates.iter().any(|d| d.usage_page == TFT_USAGE_PAGE)
+}
+
+/// Response commands accepted as a TFT chunk ack. The web driver's
+/// `setTftUserAnimation` expects cmd 65 (`SET_LED_USER_ANIMATION`); cmd 80
+/// is accepted too in case a firmware echoes the request command.
+const TFT_ACK_CMDS: [u8; 2] = [cmd::SET_LED_USER_ANIMATION, cmd::SET_TFT_USER_ANIMATION];
+
+/// How long the first chunk waits to find out whether acks arrive at all.
+/// The first chunk likely triggers the slowest flash erase, so this is
+/// generous; a firmware that never acks pays it once per upload.
+const TFT_ACK_PROBE_MS: i32 = 1000;
+
+/// Per-chunk ack timeout once acks are known to arrive. Generous because
+/// each 4096-byte chunk is likely one SPI-flash sector erase + program.
+const TFT_ACK_TIMEOUT_MS: i32 = 1500;
+
+/// Inter-chunk delay when the firmware doesn't ack.
+const TFT_DEFAULT_PACE_MS: i32 = 10;
+
+/// `AK820_TFT_PACE_MS` overrides the fallback pacing, so hardware tests
+/// can try different values without a rebuild.
+fn tft_pace_ms() -> i32 {
+    std::env::var("AK820_TFT_PACE_MS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|ms| *ms >= 0)
+        .unwrap_or(TFT_DEFAULT_PACE_MS)
+}
+
+/// Flow-control state of one TFT upload. The first chunk decides whether
+/// this firmware acks chunks; one missing ack later degrades to pacing so
+/// a silent firmware can't stall a 200-chunk GIF for minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TftFlow {
+    Probe,
+    Acked,
+    Paced,
+}
+
+impl TftFlow {
+    /// How long to wait for the ack of the chunk just written. When pacing,
+    /// the pace delay itself is spent listening, so a late ack still
+    /// counts and an early one lets the next chunk go out sooner.
+    fn ack_wait_ms(self, pace_ms: i32) -> i32 {
+        match self {
+            Self::Probe => TFT_ACK_PROBE_MS,
+            Self::Acked => TFT_ACK_TIMEOUT_MS,
+            Self::Paced => pace_ms,
+        }
+    }
+
+    fn next(self, acked: bool) -> Self {
+        match (self, acked) {
+            (Self::Probe | Self::Acked, true) => Self::Acked,
+            _ => Self::Paced,
+        }
+    }
 }
 
 /// Summary of one HID interface's report-descriptor properties.
@@ -613,6 +671,15 @@ impl Connection {
         self.set(cmd::SET_TFT_BUILT_IN_INDEX, &[index])
     }
 
+    /// Set the keyboard's RTC, which the stock TFT clock page renders.
+    /// Web driver `setTftDateTime`: 10-byte payload via
+    /// `SET_TEMPORARY_COMMAND_DATA` (cmd 52) on the control interface.
+    pub fn set_tft_datetime(&self, datetime: &TftDateTime) -> Result<()> {
+        let payload = datetime.encode()?;
+        info!(?datetime, "SET_TFT_DATE_TIME");
+        self.set(cmd::SET_TEMPORARY_COMMAND_DATA, &payload)
+    }
+
     /// Open the **TFT upload** interface — a different HID endpoint than the
     /// one returned by `open_control()`. The TFT path uses 4096-byte payload
     /// chunks (vs 56-byte chunks elsewhere), so it has its own HID interface
@@ -665,7 +732,17 @@ impl Connection {
     ///
     /// Must be called on a connection opened via `open_tft()` — the control
     /// interface's 64-byte report can't carry these chunks.
-    pub fn upload_tft_animation(&self, anim: &TftAnimation) -> Result<()> {
+    ///
+    /// **Flow control.** The web driver waits for a cmd-65 acknowledgement
+    /// after every chunk (HANDOFF § 6.9h); writing chunks back-to-back
+    /// while the firmware is still busy is the prime suspect for the
+    /// horizontal noise lines in #2. We don't know yet whether that ack
+    /// arrives on this HID handle, so the first chunk probes for it:
+    /// if it arrives, every chunk waits for its ack; if not (or if one goes
+    /// missing later), the remaining chunks are paced with a fixed delay
+    /// (`AK820_TFT_PACE_MS`, default 10 ms). The returned report says
+    /// which path the upload took.
+    pub fn upload_tft_animation(&self, anim: &TftAnimation) -> Result<TftUploadReport> {
         // Sanity-check the interface — if we're on the wrong one the
         // hidapi write will quietly fail with a frame-too-long error on macOS.
         if self.info.usage_page == 0xFF68 {
@@ -690,12 +767,16 @@ impl Connection {
             });
         }
 
+        let pace_ms = tft_pace_ms();
         info!(
             bytes = payload.len(),
             chunks = total_chunks,
             "SET_TFT_USER_ANIMATION upload"
         );
 
+        let started = std::time::Instant::now();
+        let mut flow = TftFlow::Probe;
+        let mut acknowledged = 0usize;
         // Pre-allocated per-chunk buffer: 1 report-id byte + 8 header + 4096 payload.
         let mut report = vec![0u8; 1 + TFT_REPORT_LEN];
         for i in 0..total_chunks {
@@ -705,18 +786,67 @@ impl Connection {
                 build_tft_header(cmd::SET_TFT_USER_ANIMATION, i as u16, total_chunks as u16);
 
             // Reset payload region to zero (header overwrites bytes 1..9).
-            for b in &mut report[1..] {
-                *b = 0;
-            }
+            report[1..].fill(0);
             report[0] = REPORT_ID;
             report[1..1 + HEADER_LEN].copy_from_slice(&header);
             let dst = &mut report[1 + HEADER_LEN..1 + HEADER_LEN + (end - start)];
             dst.copy_from_slice(&payload[start..end]);
 
-            trace!(chunk = i, total = total_chunks, "TFT TX");
+            trace!(chunk = i, total = total_chunks, ?flow, "TFT TX");
             self.device.write(&report)?;
+
+            let acked = self.wait_tft_ack(flow.ack_wait_ms(pace_ms));
+            if acked {
+                acknowledged += 1;
+            } else if flow != TftFlow::Paced {
+                debug!(chunk = i, pace_ms, "TFT chunk not acknowledged, pacing");
+            }
+            flow = flow.next(acked);
         }
-        Ok(())
+
+        let report = TftUploadReport {
+            chunks: total_chunks,
+            acknowledged,
+            paced_ms: (flow == TftFlow::Paced).then_some(pace_ms as u64),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        };
+        info!(?report, "SET_TFT_USER_ANIMATION done");
+        Ok(report)
+    }
+
+    /// Wait up to `timeout_ms` for the firmware's per-chunk TFT ack.
+    /// Read errors count as "no ack": they must never fail an upload that
+    /// would have succeeded fire-and-forget.
+    fn wait_tft_ack(&self, timeout_ms: i32) -> bool {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let mut buf = [0u8; PACKET_LEN];
+        loop {
+            let remaining_ms = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            if remaining_ms == 0 {
+                return false;
+            }
+            let n = match self.device.read_timeout(&mut buf, remaining_ms) {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(%e, "TFT ack read failed");
+                    return false;
+                }
+            };
+            if n >= 2 && buf[0] == MAGIC_INCOMING && TFT_ACK_CMDS.contains(&buf[1]) {
+                return true;
+            }
+            if n > 0 {
+                trace!(
+                    magic = buf[0],
+                    cmd = buf[1],
+                    "ignoring non-ack TFT input report"
+                );
+            }
+        }
     }
 
     /// Read the 128-LED per-key colour map.
@@ -805,6 +935,27 @@ mod tests {
     #[test]
     fn select_control_returns_none_without_candidates() {
         assert!(select_control(&[]).is_none());
+    }
+
+    #[test]
+    fn tft_flow_keeps_waiting_while_acks_arrive() {
+        let flow = TftFlow::Probe.next(true);
+        assert_eq!(flow, TftFlow::Acked);
+        assert_eq!(flow.next(true), TftFlow::Acked);
+        assert_eq!(flow.ack_wait_ms(10), TFT_ACK_TIMEOUT_MS);
+        assert_eq!(TftFlow::Probe.ack_wait_ms(10), TFT_ACK_PROBE_MS);
+    }
+
+    #[test]
+    fn tft_flow_paces_without_acks() {
+        // Silent firmware: decided after the first chunk.
+        assert_eq!(TftFlow::Probe.next(false), TftFlow::Paced);
+        // One missing ack later degrades instead of stalling every chunk.
+        assert_eq!(TftFlow::Acked.next(false), TftFlow::Paced);
+        // Pacing is final for the rest of the upload; the pace window is
+        // spent listening for late acks.
+        assert_eq!(TftFlow::Paced.next(true), TftFlow::Paced);
+        assert_eq!(TftFlow::Paced.ack_wait_ms(25), 25);
     }
 
     #[test]
