@@ -366,9 +366,12 @@ mod tests {
     fn target_fps_exceeds_the_per_chunk_ack_ceiling() {
         // The old per-chunk ACK path saturated around 15 fps. The streaming
         // write in `set_custom_led` is what makes a higher target honest.
+        // `black_box` keeps this a runtime check — a bare `TARGET_FPS > 15`
+        // is a const assertion and clippy (`-D warnings`) rejects it.
+        let fps = std::hint::black_box(TARGET_FPS);
         assert!(
-            TARGET_FPS > 15,
-            "audio-reactive output should exceed the old ~15 fps ACK ceiling"
+            fps > 15,
+            "audio-reactive output should exceed the old ~15 fps ACK ceiling (got {fps})"
         );
     }
 
