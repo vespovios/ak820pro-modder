@@ -4,6 +4,16 @@ This fork preserves the complete working macOS compatibility implementation
 developed against v0.7.0-beta (`382d59ced1c17abb27e0c1c247049cb473e69b66`).
 Development branch: `feature/ak820-800a-macos`.
 
+Follow-up TFT finding: both the original snapshot and PR #12 at `e217a427`
+hard-coded IMAGE_CFG byte 2 to 3. The vendor driver identifies this as a
+one-based destination slot; its single-slot ANSI configuration requires 1.
+The original static Resolve PNG appeared briefly among other animation content
+with either unmodified uploader. Changing only this slot byte to 1 in a
+temporary PR #12 CLI made the image remain visible, confirmed by the owner.
+Our app now uses slot 1 with a packet regression fixture. See the destination
+slot correction in COMPATIBILITY.md before proposing or validating TFT work.
+No message about this finding has been posted upstream.
+
 ## Scope
 
 - Detect the FF13 feature-report endpoint and preserve the original AA path.

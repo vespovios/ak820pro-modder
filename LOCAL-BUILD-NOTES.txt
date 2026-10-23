@@ -135,3 +135,25 @@ Saved setups in menu bar (23 October 2026):
   Finder and verified the saved macro typed "hi" into its test area. Both login
   and keep-running options remain enabled. Window closed, app process retained.
   No rebuild after this final approval.
+
+TFT destination-slot correction (23 October 2026):
+- A Resolve static image appeared briefly within other animation content.
+  Clock/status pages were stable; knob rotation selected those pages normally.
+- Unmodified PR #12 reproduced the issue with the installed app quit.
+- Vendor driver static analysis identified IMAGE_CFG byte 2 as the one-based
+  LCD slot; its single-slot ANSI layout requires 1. Both uploaders used 3.
+- A temporary PR #12 CLI with only slot 3 -> 1 changed uploaded the original
+  PNG; the user confirmed MTA remained visible. Original timing was retained.
+- The app now targets slot 1. Regression fixture and protocol documentation
+  added. 84 library tests passed (1 native test ignored); formatting, frontend,
+  app/DMG builds, app signature and DMG checksum checks passed.
+- Installed binary SHA256:
+  d41e5dc1a04ac9b9da8e231a0bcaffd72dd656f4433ca7b14f16df4c540a4b44
+- Original Resolve setup reapplied through the installed app, with successful
+  lighting, sleep, TFT and host completion. Imported snapshot is unchanged;
+  current caches and host controls exactly match that snapshot. Temporary
+  hold-test setup removed; original Current setup entry remains.
+- Backup: /tmp/ak820-before-tft-slot-fix/. Protocol comparison evidence and
+  validation logs: /tmp/ak820-screen-diagnosis/.
+- Final installed-app physical confirmation requested; current imported profile
+  disables Mac remaps/macros, so no macro replay test or permission change made.

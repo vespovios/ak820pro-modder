@@ -233,7 +233,17 @@ pub fn encode_tft(anim: &crate::commands::tft::TftAnimation) -> Result<Vec<u8>> 
     Ok(payload)
 }
 
-/// AKS075 framing: START(flag 0), IMAGE_CFG(sub 3), data, SAVE.
+fn tft_image_config(total_chunks: u16) -> [u8; 64] {
+    // Byte 2 is the one-based destination slot, not a transport variant.
+    // Vendor 4229BA takes LCDViewList::GetCurSel()+1; 422F36 copies it here.
+    // The tested ANSI layout declares one custom slot. Slot 3 acknowledged
+    // writes but left the image appearing briefly among other animation data.
+    let mut packet = control(0x72, 1);
+    packet[8..10].copy_from_slice(&total_chunks.to_le_bytes());
+    packet
+}
+
+/// Feature framing: START(flag 0), IMAGE_CFG(slot 1), data, SAVE.
 /// Each data block must return an input report; no speculative retries or
 /// flash commit after a missing block acknowledgement.
 pub fn upload_tft(
@@ -248,8 +258,7 @@ pub fn upload_tft(
     start[8] = 0;
     let result = (|| {
         validate_ack(&exchange(control_device, &start)?, START)?;
-        let mut cfg = control(0x72, 3);
-        cfg[8..10].copy_from_slice(&(total as u16).to_le_bytes());
+        let cfg = tft_image_config(total as u16);
         validate_ack(&exchange(control_device, &cfg)?, 0x72)?;
         let mut report = [0; TFT_CHUNK + 1];
         for (i, chunk) in payload.chunks_exact(TFT_CHUNK).enumerate() {
@@ -284,6 +293,16 @@ pub fn upload_tft(
 mod tests {
     use super::*;
     use crate::commands::lighting::Direction;
+    #[test]
+    fn tft_targets_the_first_custom_slot_and_encodes_the_full_block_count() {
+        for total in [9u16, 17, 257] {
+            let mut expected = [0; 64];
+            expected[..3].copy_from_slice(&[4, 0x72, 1]);
+            expected[8..10].copy_from_slice(&total.to_le_bytes());
+            assert_eq!(tft_image_config(total), expected);
+        }
+    }
+
     #[test]
     fn tft_uses_raw_blocks_and_a_delay_for_every_animated_frame() {
         use crate::commands::tft::{TftAnimation, TftFrame, FRAME_BYTES};

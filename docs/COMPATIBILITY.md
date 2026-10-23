@@ -66,8 +66,8 @@ USB acknowledgements establish that its firmware accepted the transaction.
 
 ## TFT display
 
-The feature-report path uses AKS075 image framing: START with flag 0,
-IMAGE_CFG (`04 72 03`) with the little-endian block count at offsets 8–9,
+The feature-report path uses START with flag 0,
+IMAGE_CFG (`04 72 01`) with the little-endian block count at offsets 8–9,
 raw 4096-byte reports on the matching FF68 endpoint, then SAVE. Each block
 waits up to one second for a data input report. Missing acknowledgements
 abort the upload without SAVE; FINISH is attempted to close a failed session.
@@ -93,6 +93,35 @@ picker, displayed its animated RGB565 preview, and received all 17 data
 acknowledgements plus SAVE during upload.
 The user confirmed the keyboard screen alternated between the GIF's purple
 and cyan frames.
+
+### Destination-slot correction
+
+The original implementation and PR #12 both used `04 72 03`. A detailed static
+Resolve image exposed a problem that acknowledgements and an initial glimpse
+of simple test images did not establish: it appeared briefly within other
+animation content rather than staying visible. Both uploaders reproduced it,
+including PR #12 running alone with the app quit. Two identical frames did
+not fix it. Apparent pixel corruption was not independently established;
+the short display time could explain that impression.
+
+Static analysis of the official ANSI Windows driver V1.0.0.5 identified byte
+2 as a one-based LCD destination slot. `004229BA` calls
+`LCDViewList::GetCurSel`, increments the result and stores it at object
+offset `52C1C`; `00422F36` copies that value into IMAGE_CFG byte 2.
+Its `rgb-keyboard.xml` declares `gif_count="1"`, loaded at `0041DA46` into
+offset `527CC` and used to populate the LCD list. Thus this layout's sole
+custom slot is 1; 3 is not a universal transport selector.
+
+A controlled test changed only that byte from 3 to 1 in a temporary PR #12
+uploader, leaving the original PNG, frame header, timing and transfer path
+unchanged. The user confirmed MTA then stayed visible on its custom-image
+page. The app now uses slot 1, with a regression fixture for the complete
+IMAGE_CFG packet and both bytes of its block count. Knob navigation between
+the stable clock/status/custom pages is separate from animation playback.
+The original imported profile needs no image or timing changes.
+
+Vendor package and executable hashes are recorded in [PER-KEY-RGB.md](PER-KEY-RGB.md).
+The Windows executable was analyzed, not run or redistributed.
 
 ## References
 

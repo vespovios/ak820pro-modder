@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed in this fork
+
+- **ANSI FF13 TFT image destination:** upload to the first custom image slot
+  (`04 72 01`) instead of hard-coded slot 3. On the tested 0C45:800A keyboard,
+  slot-3 uploads were acknowledged but the new image appeared briefly within
+  other animation content. Vendor-driver analysis and a controlled slot-only
+  hardware test confirmed the correction. Existing profile files are unchanged.
+
 Planned for 0.8.x
 - TFT image upload UI (drag-and-drop GIF / PNG → frame extract → resize / dither → upload). Gated on Phase 5b3 — USB pcap of the official Windows tool's activation sequence.
 - Audio-reactive lighting smoothness pass — likely skip the per-chunk `read_response` in `set_many_at` for write-only payloads so the HID pipeline can keep up at >15 fps.
