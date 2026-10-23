@@ -1,0 +1,137 @@
+Local macOS Apple Silicon compatibility build
+Base: v0.7.0-beta, commit 382d59ced1c17abb27e0c1c247049cb473e69b66
+
+Added support for the AK820 feature-report protocol on USB usage page
+0xFF13, including product ID 0x800A. The original output-report protocol
+remains available for devices without that feature-report endpoint.
+
+Available on this revision:
+- 20 global lighting effects, colour, brightness, speed, direction, rainbow.
+- ANSI per-key RGB: Lighting > custom, click to paint, Fill/Clear, brightness,
+  explicit Apply and local saved profile. Hardware-verified WASD and E mapping.
+- Multiple named per-key profiles with brightness, save/update/delete, and
+  Use profile to load and apply. Existing colours become "Current colours".
+- Global colour-profile cycling shortcut (Control+Option+Command+P by default),
+  configurable/disableable while the app is open. JSON file import/export
+  supports sharing and prepared ANSI profiles; see docs/examples/gaming-colours.json.
+- Complete setups: lighting, sleep, Mac remaps/macros and embedded TFT image/GIF,
+  save/update/delete, import/export, and a separate Control+Option+Command+S
+  cycling shortcut. See docs/SETUP-PROFILES.md for capture and apply semantics.
+- App-based complete setup rules: foreground macOS app detection, persisted app-to-setup
+  assignments, fallback/keep-current, debounce, pause, and no repeat screen upload
+  when the same setup remains unchanged. Setup profiles > Switch setups by app.
+- Display clock sync from the Mac's local time.
+- Standby: never, 1, 5 or 30 minutes.
+- Preset lighting and host-side automation library components.
+- Device-scoped key remapping on this Mac, restored while the app is open.
+- Local macro recording, saving, key binding and playback (Accessibility required).
+- TFT PNG/JPEG/WebP images and GIF animations, centre-cropped to 128x128.
+  Maximum 10 MB source, 30 frames. Upload and per-block acknowledgements.
+
+Unavailable: firmware/battery/current-settings telemetry, onboard keymap
+and macro uploads, hardware Fn/knob remapping and audio-reactive
+lighting. Mac-side controls replace onboard remapping/macros for this unit.
+TFT uses the FF68 4096-byte data endpoint with AKS075 framing; the user
+confirmed the four-colour test image appeared on the physical screen.
+
+See docs/COMPATIBILITY.md for protocol details and validation evidence.
+
+See docs/MAC-SIDE-CONTROLS.md for Mac-side controls and permissions.
+See docs/PER-KEY-RGB.md for the ANSI colour-bank protocol.
+
+Build locally (Apple Silicon Node and Rust must be on PATH):
+pnpm tauri:build --bundles app,dmg --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}' -- --locked
+
+Output: target/release/bundle/macos/AK820 Pro Modder.app
+Installer: target/release/bundle/dmg/AK820 Pro Modder_0.7.0-beta_aarch64.dmg
+Local ad-hoc signature verified. macOS can require Accessibility approval
+again after a rebuild. Quit/reopen after enabling it before testing macros.
+
+App switching validation (23 October 2026):
+- 79 workspace unit tests pass; 1 opt-in native integration test ignored.
+- TypeScript/Vite production build, native arm64 app and DMG, signature validation,
+  DMG checksum verification, cargo fmt and git diff checks passed.
+- Native rule editor listed running apps and saved a Finder -> temporary Gaming
+  complete setup rule. Finder activation applied lighting, sleep, TFT and host
+  controls with success acknowledgements. Pause persisted and survived relaunch.
+- Temporary setup/rules removed; original complete setup reapplied successfully.
+  All pre-test profile/cache/host/shortcut JSON values match their backup.
+- Fallback, keep-current, debounce, busy/latest activation, one attempt per
+  activation, own-app exclusion, missing references and duplicate rules covered
+  by policy/validation tests. Foreground UI automation can work in background,
+  so its AX-only window raises do not constitute app activation tests.
+- Installed binary SHA256:
+  cd46f1040391e077eb396247e6140b0e41bbba5af710c80bd0967c1dceb79e81
+- Ad-hoc signing changes require renewing Accessibility approval for macros.
+- Final installed build: user renewed Accessibility permission, app restarted,
+  Accessibility enabled confirmed in UI, saved H/I macro replay typed "hi"
+  in the app test area. No rebuild after this approval.
+
+Menu bar and login option (23 October 2026):
+- App settings contains independent Start at login and Keep running when the
+  window closes toggles, plus Hide to menu bar and Quit app controls.
+- Native template keyboard status icon labelled AK820: Show, App settings, Hide, Quit.
+- Close keeps the existing webview/backend alive and leaves a Dock fallback after
+  interactive launch; quiet login omits the Dock icon until the window is shown.
+- LaunchAgent registration points at the installed Applications executable with
+  --background and RunAtLoad=true, without KeepAlive. Registration was inspected
+  after enabling it through the native UI.
+- Compatible autostart/single-instance plugins were pinned, retaining Tauri2.11.1.
+- 81 workspace unit tests pass (1 ignored native integration test), production
+  TS/Vite and arm64 app/DMG builds pass, signature and DMG checksum verified.
+- All existing profile/setup/colour/host/shortcut JSON values match the backup.
+- Installed binary SHA256:
+  9709212b7299b631c5c2ae7aca9942401ed75266b91daf07d40448efd8a887d8
+- Backup: /tmp/ak820-before-menu-bar/.
+- Native final-build checks: opted out of background mode, closed window, and
+  verified no app process remained; relaunched and confirmed persisted opt-out;
+  restored keep-running; disabled login and verified plist removal, re-enabled;
+  explicit Quit removed the app process. launchctl bootstrap then started the
+  registered job successfully, one process with --background and job state running.
+- Inspecting a hidden app through the UI tool can reopen it; use a different
+  app for post-close observations and user confirmation for menu bar visibility.
+
+Notch placement correction (23 October 2026):
+- Native status geometry identified the cause of the missing icon: macOS placed
+  x=926..1008 inside the camera notch (right usable area starts at x=1010).
+- Stable AppKit autosaveName AK820ProModder plus first-placement default at the
+  right edge moved it to x=1527..1609. The visible position survived restart.
+  Existing saved placement is respected; no other app defaults are changed.
+- Debug-only geometry sampling is omitted from production and its temporary
+  app-data JSON was moved to /tmp/ak820-menu-position-after.json after testing.
+- Final release app and DMG built, signature and DMG checksum verified. 81 unit
+  tests pass, 1 ignored integration test; formatting and diff checks pass.
+- Installed final binary SHA256:
+  b8be817bbb21fc4091b2612644191ebb353eb6fe25783c2c04f6fd86e38546f5
+- The final installed app launched successfully via its registered login job
+  with --background, one process. Start at login and keep-running remain enabled.
+- Native visual confirmation and renewed macro Accessibility check requested.
+- User confirmed the final AK820 item is visible and its Show menu opens the
+  window. Renewed Accessibility approval was verified after restart; the saved
+  macro typed "hi" into the app test field. Normal Finder opening reused the
+  existing app. Both options confirmed enabled; window closed, process remains.
+  No rebuild after this final approval.
+
+Saved setups in menu bar (23 October 2026):
+- AK820 > Saved setups lists the same validated complete setup library, with
+  Manage saved setups opening the editor explicitly. Profile selection stays
+  on a worker and does not show/focus the main window or play macros.
+- Save/rename/delete/import update the native menu. Generation checks prevent
+  older worker results from replacing a newer menu. Native labels preserve &.
+- Menu selections share the existing setup busy gate and HID/host apply path;
+  entries disable during apply and status/tooltip report outcomes and warnings.
+  All complete-setup apply routes update this receipt. Latest IDs are re-read.
+- 83 workspace unit tests pass, 1 ignored native integration test; production
+  UI and native app/DMG build, signature and DMG checksum checks passed.
+- Installed binary SHA256:
+  b8a3e7a6141ae47926f2b925d5e15ca453ae2e2e1c30ed22d8d99dd03356a0e2
+- Quiet installed launch via the existing login job succeeded, one process.
+- Backup: /tmp/ak820-before-tray-setups/. Native menu apply/closed-window check
+  and renewed Accessibility approval requested from the user.
+- User confirmed Saved setups > Current setup applied, showed Last applied:
+  Current setup, and kept the window closed. Acknowledged lighting, setup and
+  host cache writes also confirmed the apply completed through all components.
+- After renewed Accessibility approval, restarted the installed app through
+  Finder and verified the saved macro typed "hi" into its test area. Both login
+  and keep-running options remain enabled. Window closed, app process retained.
+  No rebuild after this final approval.

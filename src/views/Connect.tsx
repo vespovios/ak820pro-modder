@@ -7,7 +7,7 @@ import { formatError } from "../errors";
 
 const CONTROL_USAGE_PAGE = 0xff68;
 
-export function Connect({ onReconnect }: { onReconnect?: () => void }) {
+export function Connect({ onReconnect }: { onReconnect?: () => Promise<void> }) {
   const [devices, setDevices] = useState<DeviceInfo[] | null>(null);
   const [probe, setProbe] = useState<ProbeReport | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -19,12 +19,13 @@ export function Connect({ onReconnect }: { onReconnect?: () => void }) {
     try {
       const list = await invoke<DeviceInfo[]>("list_devices");
       setDevices(list);
-      if (list.some((d) => d.usage_page === CONTROL_USAGE_PAGE)) {
-        setProbe(await invoke<ProbeReport>("probe_device"));
+      if (list.some((d) => [CONTROL_USAGE_PAGE, 0xff13].includes(d.usage_page))) {
+        setProbe(await invoke<ProbeReport>("verify_connection"));
       } else {
         setProbe(null);
       }
     } catch (e) {
+      setProbe(null);
       setErr(formatError(e));
     } finally {
       setBusy(false);
@@ -32,7 +33,7 @@ export function Connect({ onReconnect }: { onReconnect?: () => void }) {
   }
 
   async function reconnect() {
-    onReconnect?.();
+    await onReconnect?.();
     await refresh();
   }
 
@@ -72,9 +73,10 @@ export function Connect({ onReconnect }: { onReconnect?: () => void }) {
                 },
                 { label: "Product", value: prettyProduct(probe.product) },
                 { label: "HID interface", value: <Mono>{probe.interface}</Mono>, mono: true },
+                { label: "Protocol", value: probe.legacy ? "AK820 feature reports · handshake verified" : "Output reports" },
                 {
                   label: "Firmware",
-                  value: probe.firmware_version ? <Mono>{probe.firmware_version}</Mono> : <span className="text-fg-2">(read from System tab)</span>,
+                  value: probe.firmware_version ? <Mono>{probe.firmware_version}</Mono> : <span className="text-fg-2">{probe.legacy ? "Not exposed by this revision" : "(read from System tab)"}</span>,
                 },
               ]}
             />
@@ -100,7 +102,7 @@ export function Connect({ onReconnect }: { onReconnect?: () => void }) {
                 </thead>
                 <tbody>
                   {devices.map((d) => {
-                    const isControl = d.usage_page === CONTROL_USAGE_PAGE;
+                    const isControl = probe?.legacy ? d.usage_page === 0xff13 : d.usage_page === CONTROL_USAGE_PAGE;
                     return (
                       <tr
                         key={`${d.path}:${d.interface}:${d.usage_page}`}

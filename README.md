@@ -16,6 +16,24 @@ A clean replacement for the Windows-only AJAZZ tool — native, transparent, scr
 
 ---
 
+## This fork
+
+This fork adds hardware-verified support for the wired ANSI AK820 Pro revision
+with USB VID `0x0C45`, PID `0x800A` and the `0xFF13` feature-report protocol.
+It includes per-key colour profiles and sharing, Mac-side remaps/macros, TFT
+images/GIFs, complete setup profiles, app-based setup switching, login startup
+and a menu bar menu for switching saved setups with the window closed.
+
+The work is based on **v0.7.0-beta**. Upstream's later TFT changes have not yet
+been integrated. Hardware capabilities differ by protocol; onboard remapping,
+telemetry and audio-reactive lighting are unavailable on this tested revision.
+See [compatibility and hardware evidence](docs/COMPATIBILITY.md),
+[complete setup profiles](docs/SETUP-PROFILES.md),
+[menu bar and login behavior](docs/APP-LIFECYCLE.md), and the
+[upstream contribution handoff](docs/CONTRIBUTION-HANDOFF.md).
+The sections below retain the original project's description of its AA-protocol
+device; use the compatibility documentation for the tested 800A revision.
+
 ## Why
 
 The official Epomaker / Ajazz driver is Windows-only and limited. macOS users get nothing — no lighting tweaks, no key remapping, no macros, no TFT customisation. This project changes that, by reverse-engineering the wire protocol against the official online driver and re-implementing the full feature surface in a clean, native, scriptable stack.

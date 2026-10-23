@@ -17,7 +17,7 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 ak820-protocol = { path = "../crates/ak820-protocol" }
-tauri = { version = "2.1", features = ["devtools"] }
+tauri = { version = "2.1", features = ["devtools", "tray-icon"] }
 tauri-plugin-shell = "2.0"
 tauri-plugin-global-shortcut = "2.0"
 serde = { workspace = true }
@@ -31,8 +31,17 @@ thiserror = { workspace = true }
 # pacing inside that loop. `macros` so we can keep using #[tauri::command]
 # attrs that depend on tokio's spawn.
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "time", "macros"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "=2.5.1"
+tauri-plugin-single-instance = "=2.4.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSUserDefaults", "NSString"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWorkspace", "NSRunningApplication"] }
+core-foundation = "0.10"
+core-graphics = "0.25"
 # Audio-reactive lighting (Phase 6 part 1b). `capture` pulls in
 # ScreenCaptureKit + the Swift static lib; the Swift runtime rpath is
 # baked in by `build.rs` below.

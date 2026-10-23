@@ -8,18 +8,29 @@ use ak820_protocol::{
     Connection, DeviceInfo,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
+mod app_lifecycle;
+mod app_setups;
 #[cfg(target_os = "macos")]
 mod audio_reactive;
 mod automations;
+mod colour_files;
+mod colour_shortcuts;
+mod feature_rgb;
+mod host_controls;
 mod icloud_sync;
 mod now_playing;
 mod presets;
+mod setup_menu;
+mod setup_profiles;
+mod setup_runtime;
+mod setup_shortcuts;
 mod starter_library;
+mod tft_images;
 use automations::{Automation, RunResult};
 use now_playing::NowPlaying;
 use presets::Preset;
@@ -54,17 +65,34 @@ fn hid_to_shortcut_label(hid: u8) -> Option<&'static str> {
 /// automations list. Called on app startup and after every
 /// `save_automations` / `assign_automation_marker` / `unassign_*`.
 ///
-/// Always wipes the existing registration first — a marker can only be
-/// bound to one automation at a time, and the user is free to reshuffle.
+/// Replaces marker registrations only — a marker can only be bound to
+/// one automation at a time. Other global shortcuts remain registered.
 fn refresh_automation_shortcuts(app: &AppHandle) -> Result<(), String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
-    let list = automations::load(dir)?;
+    let list = automations::load(dir.clone())?;
+    let host_config = host_controls::load(&dir)?;
+    if host_config.enabled
+        && host_config.markers.values().any(|marker| {
+            list.iter()
+                .any(|a| a.marker_hid.map(u16::from) == Some(*marker))
+        })
+    {
+        return Err(
+            "An automation and a macro share a trigger marker. Choose a different binding.".into(),
+        );
+    }
     let mgr = app.global_shortcut();
-    mgr.unregister_all()
-        .map_err(|e| format!("unregister_all: {e}"))?;
+    // Refresh marker bindings without unregistering the user's colour hotkey.
+    for hid in MARKER_HID_RANGE {
+        if let Some(label) = hid_to_shortcut_label(hid) {
+            if mgr.is_registered(label) {
+                mgr.unregister(label).map_err(|e| e.to_string())?;
+            }
+        }
+    }
     for a in list {
         let Some(marker) = a.marker_hid else { continue };
         let Some(label) = hid_to_shortcut_label(marker) else {
@@ -84,6 +112,43 @@ fn refresh_automation_shortcuts(app: &AppHandle) -> Result<(), String> {
         })
         .map_err(|e| format!("on_shortcut({label}): {e}"))?;
         tracing::info!(automation_id, label, "registered global-shortcut marker");
+    }
+    if host_config.enabled {
+        for (macro_id, marker) in host_config.markers {
+            let label = hid_to_shortcut_label(marker as u8).ok_or("Invalid macro trigger")?;
+            let shortcut: Shortcut = label
+                .parse()
+                .map_err(|e| format!("parse macro trigger: {e}"))?;
+            let app_handle = app.clone();
+            mgr.on_shortcut(shortcut, move |_app, _shortcut, event| {
+                if event.state() != ShortcutState::Pressed {
+                    return;
+                }
+                let host = app_handle.state::<Arc<host_controls::HostControls>>();
+                if host.playback.is_running() {
+                    host.playback.stop();
+                    return;
+                }
+                let result = (|| {
+                    let dir = app_handle
+                        .path()
+                        .app_data_dir()
+                        .map_err(|e| e.to_string())?;
+                    let cfg = host_controls::load(&dir)?;
+                    let m = cfg
+                        .macros
+                        .into_iter()
+                        .find(|m| m.macro_id == macro_id)
+                        .ok_or("Macro no longer exists")?;
+                    host.playback.start(m, 80)
+                })();
+                if let Err(error) = result {
+                    host.playback.record_error(error.clone());
+                    tracing::warn!(%error, "macro trigger failed");
+                }
+            })
+            .map_err(|e| format!("Register {label}: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -226,27 +291,129 @@ fn list_devices() -> Result<Vec<DeviceInfo>, AppError> {
 /// loop would block view-level operations (lighting set / system reads).
 #[tauri::command]
 fn probe_device() -> Result<ProbeReport, AppError> {
-    const CONTROL_USAGE_PAGE: u16 = 0xFF68;
     let candidates = ak820_protocol::enumerate()?;
     Ok(
         match candidates
             .iter()
-            .find(|d| d.usage_page == CONTROL_USAGE_PAGE)
+            .find(|d| d.usage_page == ak820_protocol::legacy::USAGE_PAGE)
+            .or_else(|| candidates.iter().find(|d| d.usage_page == 0xff68))
         {
             Some(d) => ProbeReport {
                 connected: true,
                 interface: d.interface,
                 product: d.product.clone(),
                 firmware_version: None,
+                legacy: d.usage_page == ak820_protocol::legacy::USAGE_PAGE,
             },
             None => ProbeReport {
                 connected: false,
                 interface: -1,
                 product: None,
                 firmware_version: None,
+                legacy: false,
             },
         },
     )
+}
+
+/// On-demand protocol verification, distinct from the cheap presence poll.
+#[tauri::command]
+async fn verify_connection(state: State<'_, Arc<ConnState>>) -> Result<ProbeReport, AppError> {
+    state.with(|slot| Ok(ensure_open(slot)?.probe()?)).await
+}
+
+#[tauri::command]
+async fn sync_keyboard_clock(
+    state: State<'_, Arc<ConnState>>,
+    time: ak820_protocol::legacy::ClockTime,
+) -> Result<(), AppError> {
+    state
+        .with(|slot| Ok(ensure_open(slot)?.sync_clock(&time)?))
+        .await
+}
+
+#[tauri::command]
+async fn set_sleep_minutes(
+    app: AppHandle,
+    state: State<'_, Arc<ConnState>>,
+    minutes: u8,
+) -> Result<(), AppError> {
+    let dir = host_dir(&app).map_err(AppError::Protocol)?;
+    state
+        .with(|slot| {
+            ensure_open(slot)?.set_sleep_minutes(minutes)?;
+            setup_profiles::record(&dir, |current| current.sleep_minutes = Some(minutes)).map_err(
+                |e| {
+                    AppError::Protocol(format!(
+                        "Sleep timer applied, but saving its last value failed: {e}"
+                    ))
+                },
+            )
+        })
+        .await
+}
+
+#[tauri::command]
+async fn prepare_tft_image(bytes: Vec<u8>) -> Result<tft_images::PreparedImage, String> {
+    tokio::task::spawn_blocking(move || tft_images::prepare(&bytes))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[derive(Clone, Serialize)]
+struct TftProgress {
+    upload_id: String,
+    completed: usize,
+    total: usize,
+}
+
+#[tauri::command]
+async fn upload_tft_image(
+    app: AppHandle,
+    state: State<'_, Arc<ConnState>>,
+    animation: ak820_protocol::commands::tft::TftAnimation,
+    upload_id: String,
+    name: Option<String>,
+) -> Result<(), String> {
+    // Validate before acquiring hardware. Never retry a partially completed
+    // image transaction through ConnState's ordinary stale-handle retry.
+    ak820_protocol::legacy::encode_tft(&animation).map_err(|e| e.to_string())?;
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let dir = host_dir(&app)?;
+        let display_name: String = name
+            .unwrap_or_else(|| "Custom display".into())
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(128)
+            .collect();
+        let mut slot = state.0.blocking_lock();
+        let conn = ensure_open(&mut slot).map_err(|e| e.to_string())?;
+        conn.upload_feature_tft(&animation, |completed, total| {
+            let _ = app.emit(
+                "tft-progress",
+                TftProgress {
+                    upload_id: upload_id.clone(),
+                    completed,
+                    total,
+                },
+            );
+        })
+        .map_err(|e| e.to_string())?;
+        setup_profiles::record(&dir, |current| {
+            current.display = Some(setup_profiles::Display {
+                name: if display_name.trim().is_empty() {
+                    "Custom display".into()
+                } else {
+                    display_name
+                },
+                animation,
+            })
+        })
+        .map_err(|e| format!("Screen uploaded, but saving its last image failed: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -427,6 +594,46 @@ async fn set_custom_led(
         .await
 }
 
+#[tauri::command]
+fn get_feature_rgb_profile(app: AppHandle) -> Result<Option<feature_rgb::Profile>, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    feature_rgb::load(&dir)
+}
+
+#[tauri::command]
+fn list_feature_rgb_profiles(app: AppHandle) -> Result<Vec<feature_rgb::NamedProfile>, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    feature_rgb::list_profiles(&dir)
+}
+
+#[tauri::command]
+fn save_feature_rgb_profile(
+    app: AppHandle,
+    id: Option<u64>,
+    name: String,
+    profile: feature_rgb::Profile,
+) -> Result<feature_rgb::NamedProfile, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    feature_rgb::save_profile(&dir, id, name, profile)
+}
+
+#[tauri::command]
+fn delete_feature_rgb_profile(app: AppHandle, id: u64) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    feature_rgb::delete_profile(&dir, id)
+}
+
+#[tauri::command]
+async fn apply_feature_rgb(
+    app: AppHandle,
+    profile: feature_rgb::Profile,
+    profile_id: Option<u64>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || colour_shortcuts::apply_locked(&app, profile, profile_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[derive(Serialize)]
 struct MacroLimits {
     slot_count: usize,
@@ -499,8 +706,14 @@ async fn assign_automation_marker(
             if let Some(m) = list[pos].marker_hid {
                 return Ok(m);
             }
-            let used: std::collections::HashSet<u8> =
+            let mut used: std::collections::HashSet<u8> =
                 list.iter().filter_map(|a| a.marker_hid).collect();
+            used.extend(
+                host_controls::load(&dir)?
+                    .markers
+                    .values()
+                    .map(|marker| *marker as u8),
+            );
             let chosen = match suggested {
                 Some(s) if MARKER_HID_RANGE.contains(&s) && !used.contains(&s) => s,
                 _ => MARKER_HID_RANGE
@@ -637,6 +850,16 @@ async fn apply_preset(
 ) -> Result<ApplyPresetReport, AppError> {
     let preset =
         presets::find(&id).ok_or_else(|| AppError::Protocol(format!("preset '{id}' not found")))?;
+    // Reject an unsupported combination before applying its lighting or
+    // automation components, avoiding a partially applied preset.
+    if options.keymap || options.fn_keymap {
+        state.with(|slot| {
+            if ensure_open(slot)?.is_legacy() {
+                return Err(AppError::Protocol("Onboard key overrides are unavailable on this revision. Select lighting and automations only.".into()));
+            }
+            Ok(())
+        }).await?;
+    }
     let mut report = ApplyPresetReport::default();
 
     // 1. Lighting — single SET_LED_EFFECT write, optional.
@@ -647,6 +870,16 @@ async fn apply_preset(
                 .with(|slot| {
                     let conn = ensure_open(slot)?;
                     conn.set_lighting(&cfg)?;
+                    if conn.is_legacy() {
+                        let dir = host_dir(&app).map_err(AppError::Protocol)?;
+                        setup_profiles::record(&dir, |current| {
+                            current.lighting = Some(setup_profiles::Lighting::Global {
+                                config: cfg.clone(),
+                            })
+                        })
+                        .map_err(AppError::Protocol)?;
+                        let _ = app.emit("setup-global-lighting", &cfg);
+                    }
                     Ok(())
                 })
                 .await?;
@@ -778,6 +1011,7 @@ async fn force_reconnect(state: State<'_, Arc<ConnState>>) -> Result<(), AppErro
 
 #[tauri::command]
 async fn apply_lighting(
+    app: AppHandle,
     state: State<'_, Arc<ConnState>>,
     config: LightingConfig,
 ) -> Result<(), AppError> {
@@ -786,6 +1020,19 @@ async fn apply_lighting(
         .with(|slot| {
             let conn = ensure_open(slot)?;
             conn.set_lighting(&config)?;
+            if conn.is_legacy() {
+                let dir = host_dir(&app).map_err(AppError::Protocol)?;
+                setup_profiles::record(&dir, |current| {
+                    current.lighting = Some(setup_profiles::Lighting::Global {
+                        config: config.clone(),
+                    })
+                })
+                .map_err(|e| {
+                    AppError::Protocol(format!(
+                        "Lighting applied, but saving its last value failed: {e}"
+                    ))
+                })?;
+            }
             Ok(())
         })
         .await
@@ -824,6 +1071,12 @@ async fn audio_reactive_start(
     conn: State<'_, Arc<ConnState>>,
     audio: State<'_, Arc<audio_reactive::AudioReactiveState>>,
 ) -> Result<(), AppError> {
+    conn.with(|slot| {
+        if ensure_open(slot)?.is_legacy() {
+            return Err(AppError::Protocol("Audio-reactive lighting requires per-key RGB, which is unavailable on this keyboard revision.".into()));
+        }
+        Ok(())
+    }).await?;
     let audio = audio.inner().clone();
     let conn = conn.inner().clone();
     audio.start(conn).await
@@ -925,6 +1178,134 @@ async fn icloud_sync_pull(app: AppHandle) -> Result<Option<u64>, AppError> {
     Ok(result)
 }
 
+// Mac-side keyboard controls. These do not use undocumented firmware writes.
+fn host_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path().app_data_dir().map_err(|e| e.to_string())
+}
+fn commit_host_config(
+    app: &AppHandle,
+    host: &host_controls::HostControls,
+    previous: &host_controls::Config,
+    next: host_controls::Config,
+) -> Result<host_controls::Status, String> {
+    let dir = host_dir(app)?;
+    let reserved = automations::load(dir.clone())?
+        .into_iter()
+        .filter_map(|a| a.marker_hid.map(u16::from))
+        .collect();
+    let next = host_controls::prepare(next, &reserved)?;
+    host.commit(&dir, previous, &next)?;
+    if let Err(error) = refresh_automation_shortcuts(app) {
+        let rollback = host.commit(&dir, &next, previous);
+        let restore = refresh_automation_shortcuts(app);
+        return Err(format!("Could not register macro triggers: {error}. Restore profile: {rollback:?}; restore shortcuts: {restore:?}"));
+    }
+    host.status(&dir)
+}
+#[tauri::command]
+async fn get_host_controls(
+    app: AppHandle,
+    host: State<'_, Arc<host_controls::HostControls>>,
+) -> Result<host_controls::Status, String> {
+    let _guard = host.gate.lock().await;
+    let _ = host.reapply(&host_dir(&app)?);
+    host.status(&host_dir(&app)?)
+}
+#[tauri::command]
+async fn save_host_remaps(
+    app: AppHandle,
+    host: State<'_, Arc<host_controls::HostControls>>,
+    remaps: Vec<host_controls::Remap>,
+    enabled: bool,
+) -> Result<host_controls::Status, String> {
+    let _guard = host.gate.lock().await;
+    host.playback.stop_and_wait();
+    let previous = host_controls::load(&host_dir(&app)?)?;
+    let mut next = previous.clone();
+    next.remaps = remaps;
+    next.enabled = enabled;
+    commit_host_config(&app, &host, &previous, next)
+}
+#[tauri::command]
+async fn get_host_macros(app: AppHandle) -> Result<Vec<Macro>, String> {
+    Ok(host_controls::load(&host_dir(&app)?)?.macros)
+}
+#[tauri::command]
+fn host_macro_limits() -> MacroLimits {
+    MacroLimits {
+        slot_count: 100,
+        byte_limit: 4 + host_controls::MAX_ACTIONS * 4,
+        max_actions_per_macro: host_controls::MAX_ACTIONS,
+    }
+}
+#[tauri::command]
+async fn save_host_macros(
+    app: AppHandle,
+    host: State<'_, Arc<host_controls::HostControls>>,
+    macros: Vec<Macro>,
+) -> Result<(), String> {
+    let _guard = host.gate.lock().await;
+    host.playback.stop_and_wait();
+    let previous = host_controls::load(&host_dir(&app)?)?;
+    let mut next = previous.clone();
+    next.macros = macros;
+    commit_host_config(&app, &host, &previous, next)?;
+    Ok(())
+}
+#[tauri::command]
+async fn play_host_macro(
+    app: AppHandle,
+    host: State<'_, Arc<host_controls::HostControls>>,
+    macro_id: u8,
+) -> Result<(), String> {
+    let cfg = host_controls::load(&host_dir(&app)?)?;
+    let m = cfg
+        .macros
+        .into_iter()
+        .find(|m| m.macro_id == macro_id)
+        .ok_or("Save the macro before playing it")?;
+    host.playback.start(m, 3000)
+}
+#[tauri::command]
+fn stop_host_macro(host: State<'_, Arc<host_controls::HostControls>>) {
+    host.playback.stop();
+}
+#[tauri::command]
+fn host_playback_status(host: State<'_, Arc<host_controls::HostControls>>) -> serde_json::Value {
+    serde_json::json!({ "running": host.playback.is_running(), "accessibility": host_controls::accessibility(), "error": host.playback.last_error() })
+}
+#[tauri::command]
+fn open_keyboard_accessibility_settings() -> Result<(), String> {
+    host_controls::request_accessibility();
+    std::process::Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .status()
+        .map_err(|e| e.to_string())
+        .and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err("Could not open Accessibility settings".into())
+            }
+        })
+}
+
+#[tauri::command]
+fn open_keyboard_input_settings() -> Result<(), String> {
+    host_controls::request_input_monitoring();
+    std::process::Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+        .status()
+        .map_err(|e| e.to_string())
+        .and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err("Could not open Input Monitoring settings".into())
+            }
+        })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -935,7 +1316,25 @@ pub fn run() {
         .init();
 
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            if !args.iter().any(|a| a == "--background") {
+                app_lifecycle::show(app);
+            }
+        }))
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args(["--background"])
+                .app_name("AK820 Pro Modder")
+                .build(),
+        )
+        .manage(Arc::new(app_lifecycle::Runtime::default()))
+        .manage(Arc::new(setup_menu::Runtime::default()))
         .manage(Arc::new(ConnState::default()))
+        .manage(Arc::new(host_controls::HostControls::default()))
+        .manage(Arc::new(colour_shortcuts::Runtime::default()))
+        .manage(Arc::new(setup_shortcuts::Runtime::default()))
+        .manage(Arc::new(app_setups::Runtime::default()))
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init());
 
     // Audio-reactive state is macOS-only; on Linux/Windows we still
@@ -948,8 +1347,46 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
+            app_lifecycle::app_lifecycle_status,
+            app_lifecycle::set_start_at_login,
+            app_lifecycle::set_keep_running_on_close,
+            app_lifecycle::hide_to_menu_bar,
+            app_lifecycle::quit_keyboard_app,
+            setup_runtime::get_setup_snapshot,
+            setup_runtime::list_setup_profiles,
+            setup_runtime::save_setup_profile,
+            setup_runtime::delete_setup_profile,
+            setup_runtime::apply_setup_profile,
+            setup_runtime::get_saved_sleep,
+            setup_runtime::get_saved_tft,
+            setup_runtime::export_setup_profiles,
+            setup_runtime::import_setup_profiles,
+            setup_shortcuts::setup_shortcut_status,
+            setup_shortcuts::save_setup_shortcut,
+            app_setups::app_setup_status,
+            app_setups::save_app_setup_rules,
+            app_setups::list_setup_apps,
+            colour_files::export_colour_profiles,
+            colour_files::import_colour_profiles,
+            colour_shortcuts::colour_shortcut_status,
+            colour_shortcuts::save_colour_shortcut,
+            get_host_controls,
+            save_host_remaps,
+            get_host_macros,
+            save_host_macros,
+            host_macro_limits,
+            play_host_macro,
+            stop_host_macro,
+            host_playback_status,
+            open_keyboard_accessibility_settings,
+            open_keyboard_input_settings,
             list_devices,
             probe_device,
+            verify_connection,
+            sync_keyboard_clock,
+            set_sleep_minutes,
+            prepare_tft_image,
+            upload_tft_image,
             close_device,
             list_lighting_modes,
             apply_lighting,
@@ -969,6 +1406,11 @@ pub fn run() {
             macro_limits,
             get_custom_led,
             set_custom_led,
+            get_feature_rgb_profile,
+            list_feature_rgb_profiles,
+            save_feature_rgb_profile,
+            delete_feature_rgb_profile,
+            apply_feature_rgb,
             get_now_playing,
             list_automations,
             save_automations,
@@ -1082,8 +1524,44 @@ pub fn run() {
             if let Err(e) = refresh_automation_shortcuts(app.handle()) {
                 tracing::warn!("initial automation shortcut registration failed: {e}");
             }
+            if let Err(e) = colour_shortcuts::init(app.handle()) {
+                tracing::warn!("colour shortcut registration failed: {e}");
+            }
+            if let Err(e)=setup_shortcuts::init(app.handle()) {
+                tracing::warn!("setup shortcut registration failed: {e}");
+            }
+            if let Err(e) = app_lifecycle::init(app.handle()) {
+                tracing::warn!("Menu bar initialization failed: {e}");
+            }
+            app_setups::init(app.handle());
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let host = app_handle.state::<Arc<host_controls::HostControls>>();
+                    {
+                        let _guard = host.gate.lock().await;
+                        if let Ok(dir) = host_dir(&app_handle) { let _ = host.reapply(&dir); }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running AK820 Pro app");
+        .build(tauri::generate_context!())
+        .expect("error while building AK820 Pro app")
+        .run(|app, event| {
+            match &event {
+                tauri::RunEvent::Ready => app_lifecycle::startup(app),
+                tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } if label == "main" => app_lifecycle::handle_close(app, api),
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => app_lifecycle::show(app),
+                _ => {}
+            }
+            if matches!(event, tauri::RunEvent::Exit) {
+                let _ = app.global_shortcut().unregister_all();
+                if let Ok(dir) = host_dir(app) {
+                    app.state::<Arc<host_controls::HostControls>>().shutdown(&dir);
+                }
+            }
+        });
 }

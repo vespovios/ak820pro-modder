@@ -27,7 +27,7 @@ import type {
 } from "../types";
 import { formatError } from "../errors";
 
-export function Presets() {
+export function Presets({ legacy = false }: { legacy?: boolean }) {
   const [presets, setPresets] = useState<Preset[] | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>("All");
   const [busy, setBusy] = useState(false);
@@ -108,6 +108,7 @@ export function Presets() {
 
       {reviewing && (
         <ApplyModal
+          legacy={legacy}
           preset={reviewing}
           busy={busy}
           onCancel={() => setReviewing(null)}
@@ -164,11 +165,13 @@ function PresetCard({
 /* ---------------------------------------------------- apply modal -- */
 
 function ApplyModal({
+  legacy,
   preset,
   busy,
   onCancel,
   onApply,
 }: {
+  legacy: boolean;
   preset: Preset;
   busy: boolean;
   onCancel: () => void;
@@ -176,8 +179,8 @@ function ApplyModal({
 }) {
   const [opts, setOpts] = useState<ApplyPresetOptions>({
     lighting: preset.lighting !== null,
-    keymap: preset.keymap_overrides.length > 0,
-    fn_keymap: preset.fn_keymap_overrides.length > 0,
+    keymap: !legacy && preset.keymap_overrides.length > 0,
+    fn_keymap: !legacy && preset.fn_keymap_overrides.length > 0,
     automations: preset.automation_seeds.length > 0,
   });
   const nothingPicked = !opts.lighting && !opts.keymap && !opts.fn_keymap && !opts.automations;
@@ -202,6 +205,7 @@ function ApplyModal({
         </header>
 
         <div className="space-y-3 px-5 py-4">
+          {legacy && <p className="text-sm text-fg-2">Your keyboard supports the lighting and app automation components. Onboard key overrides are unavailable for this revision.</p>}
           <p className="text-xs text-fg-2">Pick what to apply — unchecked parts of your keyboard stay untouched.</p>
           <Option
             label="Lighting"
@@ -212,14 +216,14 @@ function ApplyModal({
           />
           <Option
             label="Base-layer key overrides"
-            available={preset.keymap_overrides.length > 0}
+            available={!legacy && preset.keymap_overrides.length > 0}
             checked={opts.keymap}
             onToggle={(v) => setOpts({ ...opts, keymap: v })}
             detail={preset.keymap_overrides.length > 0 ? `${preset.keymap_overrides.length} slot(s) will be patched. Unchanged slots stay as they are.` : "Preset doesn't change base-layer keys"}
           />
           <Option
             label="Fn-layer key overrides"
-            available={preset.fn_keymap_overrides.length > 0}
+            available={!legacy && preset.fn_keymap_overrides.length > 0}
             checked={opts.fn_keymap}
             onToggle={(v) => setOpts({ ...opts, fn_keymap: v })}
             detail={preset.fn_keymap_overrides.length > 0 ? `${preset.fn_keymap_overrides.length} slot(s) will be patched on the Fn layer.` : "Preset doesn't change Fn-layer keys"}

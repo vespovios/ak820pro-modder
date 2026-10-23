@@ -13,7 +13,7 @@ use crate::commands::tft::{build_tft_header, TftAnimation};
 use crate::protocol::{
     build_frame, cmd, HEADER_LEN, MAGIC_INCOMING, PACKET_LEN, PAYLOAD_PER_PACKET, REPORT_ID,
 };
-use crate::{error::*, CONTROL_INTERFACE, PRODUCT_IDS, VENDOR_ID};
+use crate::{error::*, legacy, CONTROL_INTERFACE, PRODUCT_IDS, VENDOR_ID};
 
 /// Default response timeout (ms) for non-streaming GET/SET commands.
 const DEFAULT_TIMEOUT_MS: i32 = 500;
@@ -203,7 +203,12 @@ impl Connection {
         } else {
             candidates
                 .iter()
-                .find(|d| PREFERRED_USAGE_PAGES.contains(&d.usage_page))
+                .find(|d| d.usage_page == legacy::USAGE_PAGE)
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .find(|d| PREFERRED_USAGE_PAGES.contains(&d.usage_page))
+                })
                 .or_else(|| candidates.iter().find(|d| d.interface == CONTROL_INTERFACE))
                 .cloned()
         };
@@ -236,17 +241,46 @@ impl Connection {
         &self.device
     }
 
+    pub fn is_legacy(&self) -> bool {
+        self.info.usage_page == legacy::USAGE_PAGE
+    }
+
+    pub fn sync_clock(&self, time: &legacy::ClockTime) -> Result<()> {
+        if !self.is_legacy() {
+            return Err(Error::NotImplemented(
+                "clock sync for the output-report protocol",
+            ));
+        }
+        legacy::sync_clock(&self.device, time)
+    }
+
+    pub fn set_sleep_minutes(&self, minutes: u8) -> Result<()> {
+        if !self.is_legacy() {
+            return Err(Error::NotImplemented(
+                "use the game-mode sleep presets for this protocol",
+            ));
+        }
+        legacy::set_sleep(&self.device, minutes)
+    }
+
     pub fn probe(&self) -> Result<ProbeReport> {
+        if self.is_legacy() {
+            legacy::verify(&self.device)?;
+        }
         Ok(ProbeReport {
             connected: true,
             interface: self.info.interface,
             product: self.info.product.clone(),
             firmware_version: None,
+            legacy: self.is_legacy(),
         })
     }
 
     /// Send one output report on this interface.
     fn write_output_report(&self, frame: &[u8; PACKET_LEN]) -> Result<()> {
+        if self.is_legacy() {
+            return Err(Error::NotImplemented("this keyboard uses feature reports; onboard keymaps, macros, per-key RGB and device telemetry are not available"));
+        }
         let mut buf = [0u8; PACKET_LEN + 1];
         buf[0] = REPORT_ID;
         buf[1..].copy_from_slice(frame);
@@ -460,6 +494,9 @@ impl Connection {
 
     /// Apply a complete lighting configuration.
     pub fn set_lighting(&self, cfg: &LightingConfig) -> Result<()> {
+        if self.is_legacy() {
+            return legacy::set_lighting(&self.device, cfg);
+        }
         let payload = lighting::led_effect_payload(cfg);
         let (r, g, b) = cfg.rgb();
         info!(
@@ -593,6 +630,41 @@ impl Connection {
         Ok(Self { device, info: pick })
     }
 
+    /// Upload on this feature-report keyboard's matching FF68 endpoint.
+    /// Refuses ambiguous multiple-device matches before changing any state.
+    pub fn upload_feature_tft(
+        &self,
+        anim: &TftAnimation,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<()> {
+        if !self.is_legacy() {
+            return Err(Error::NotImplemented(
+                "feature TFT upload on an output-report keyboard",
+            ));
+        }
+        let candidates: Vec<_> = enumerate()?
+            .into_iter()
+            .filter(|d| {
+                d.usage_page == 0xff68 && d.pid == self.info.pid && d.serial == self.info.serial
+            })
+            .collect();
+        if candidates.len() != 1 {
+            return Err(Error::UnexpectedResponse(
+                "Connect exactly one matching wired AK820 for TFT upload".into(),
+            ));
+        }
+        let api = HidApi::new()?;
+        let data = api.open_path(&std::ffi::CString::new(candidates[0].path.clone()).unwrap())?;
+        let mut descriptor = [0; 4096];
+        let n = data.get_report_descriptor(&mut descriptor)?;
+        if parse_max_output_report_size(&descriptor[..n]) != Some(legacy::TFT_CHUNK) {
+            return Err(Error::UnexpectedResponse(
+                "TFT endpoint does not expose 4096-byte reports".into(),
+            ));
+        }
+        legacy::upload_tft(&self.device, &data, anim, progress)
+    }
+
     /// Upload a TFT animation as a single chunked transaction. Re-uses our
     /// existing `TftAnimation::encode()` for the 256-B-header + RGB565 stream
     /// and applies the bespoke 8-B per-chunk header — both decoded from the
@@ -674,6 +746,15 @@ impl Connection {
         self.set_many_at(cmd::SET_CUSTOM_LED_DATA, 0, &payload, true)
     }
 
+    pub fn set_feature_custom_lighting(&self, map: &CustomLedMap, brightness: u8) -> Result<()> {
+        if !self.is_legacy() {
+            return Err(Error::NotImplemented(
+                "feature custom RGB on an output-report keyboard",
+            ));
+        }
+        crate::legacy_rgb::apply(&self.device, map, brightness)
+    }
+
     /// Read the device-info struct (firmware, battery, profile, …).
     pub fn get_device_info(&self) -> Result<DeviceInfoReport> {
         let payload = self.get(cmd::GET_DEVICE_INFO, 48)?;
@@ -705,4 +786,5 @@ pub struct ProbeReport {
     pub interface: i32,
     pub product: Option<String>,
     pub firmware_version: Option<String>,
+    pub legacy: bool,
 }

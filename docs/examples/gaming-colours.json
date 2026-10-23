@@ -1,0 +1,20 @@
+{
+  "format": "ak820-colour-profiles",
+  "version": 1,
+  "keyboard": "ak820-pro-ansi",
+  "profiles": [
+    {
+      "name": "Gaming",
+      "brightness": 3,
+      "base_color": "202040",
+      "keys": {
+        "W": "FF0000",
+        "A": "00FF00",
+        "S": "0000FF",
+        "D": "FFFF00",
+        "Esc": "FF8800",
+        "Space": "00FFFF"
+      }
+    }
+  ]
+}

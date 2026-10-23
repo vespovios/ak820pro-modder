@@ -14,7 +14,7 @@ import {
 import { formatError } from "../errors";
 
 // Mirrors `KeyAction` from `ak820_protocol::commands::keymap`.
-type KeyAction =
+export type KeyAction =
   | { kind: "default" }
   | { kind: "keyboard"; usage: number }
   | { kind: "mouse"; button: number; value: number }
@@ -37,7 +37,7 @@ interface AutomationSummary {
   marker_hid: number | null;
 }
 
-interface Keymap {
+export interface Keymap {
   slots: KeyAction[];
 }
 
@@ -386,7 +386,7 @@ function sameAction(a: KeyAction, b: KeyAction): boolean {
 // ---------------------------------------------------------------------------
 // Keyboard surface
 
-function KeyboardSurface({
+export function KeyboardSurface({
   layout,
   km,
   dirty,

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { PageHeader } from "../components/Layout";
 import { Badge, Button, Card, ErrorBanner, Mono } from "../components/ui";
 import { formatError } from "../errors";
+import { CODE_TO_HID } from "../data/keyboard-usage";
 
 /* ----------------------------------------------------------------- types -- */
 
@@ -34,62 +35,6 @@ interface MacroLimits {
  * Keep this list pragmatic — anything not here gets recorded as keycode 0 with
  * a warning so the user can manually fix the event later.
  */
-const CODE_TO_HID: Record<string, number> = {
-  // Letters A–Z (HID 4..29)
-  ...Object.fromEntries(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map((c, i) => [`Key${c}`, 4 + i]),
-  ),
-  // Digits 1..9 then 0 (HID 30..39)
-  ...Object.fromEntries(
-    "123456789".split("").map((d, i) => [`Digit${d}`, 30 + i]),
-  ),
-  Digit0: 39,
-  // Whitespace & editing
-  Enter: 40,
-  Escape: 41,
-  Backspace: 42,
-  Tab: 43,
-  Space: 44,
-  Minus: 45,
-  Equal: 46,
-  BracketLeft: 47,
-  BracketRight: 48,
-  Backslash: 49,
-  Semicolon: 51,
-  Quote: 52,
-  Backquote: 53,
-  Comma: 54,
-  Period: 55,
-  Slash: 56,
-  CapsLock: 57,
-  // F1..F12 (HID 58..69)
-  ...Object.fromEntries(
-    Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, 58 + i]),
-  ),
-  PrintScreen: 70,
-  ScrollLock: 71,
-  Pause: 72,
-  Insert: 73,
-  Home: 74,
-  PageUp: 75,
-  Delete: 76,
-  End: 77,
-  PageDown: 78,
-  ArrowRight: 79,
-  ArrowLeft: 80,
-  ArrowDown: 81,
-  ArrowUp: 82,
-  // Modifiers (HID 224..231)
-  ControlLeft: 224,
-  ShiftLeft: 225,
-  AltLeft: 226,
-  MetaLeft: 227,
-  ControlRight: 228,
-  ShiftRight: 229,
-  AltRight: 230,
-  MetaRight: 231,
-};
-
 /** Lookup for the action editor's label column. */
 const HID_TO_LABEL: Record<number, string> = Object.fromEntries(
   Object.entries(CODE_TO_HID).map(([code, hid]) => [hid, prettyCode(code)]),
@@ -103,7 +48,7 @@ function prettyCode(c: string): string {
 
 /* ----------------------------------------------------------- component -- */
 
-export function Macros() {
+export function Macros({ host = false }: { host?: boolean }) {
   const [remote, setRemote] = useState<Macro[] | null>(null);
   const [draft, setDraft] = useState<Macro[]>([]);
   const [names, setNames] = useState<Record<number, string>>({});
@@ -115,6 +60,39 @@ export function Macros() {
   const recordRef = useRef<{ lastAt: number; actions: MacroAction[] } | null>(
     null,
   );
+
+  const [playback, setPlayback] = useState<{ running: boolean; accessibility: boolean; error: string | null }>({ running: false, accessibility: false, error: null });
+  const [playReceipt, setPlayReceipt] = useState<string | null>(null);
+  const [testText, setTestText] = useState("");
+  const wasPlaying = useRef(false);
+  async function checkPlayback() {
+    try {
+      const next = await invoke<typeof playback>("host_playback_status");
+      if (wasPlaying.current && !next.running) setPlayReceipt(next.error ? "Playback failed. See the error above." : "Playback finished. Check the destination or test area for its output.");
+      wasPlaying.current = next.running;
+      setPlayback(next);
+    } catch (e) { setErr(formatError(e)); }
+  }
+  useEffect(() => {
+    if (!host) return;
+    void checkPlayback();
+    const id = window.setInterval(() => void checkPlayback(), 750);
+    return () => window.clearInterval(id);
+  }, [host]);
+  async function play() {
+    if (selectedId === null) return;
+    setErr(null);
+    try {
+      await invoke("play_host_macro", { macroId: selectedId });
+      setPlayReceipt("Playback starts in 3 seconds. Click the test area below or switch to the destination app.");
+      await checkPlayback();
+    } catch (e) { setErr(formatError(e)); }
+  }
+  async function stopPlayback() {
+    await invoke("stop_host_macro"); await checkPlayback();
+    wasPlaying.current = false;
+    setPlayReceipt("Playback stopped. Any held macro keys are released.");
+  }
 
   /* ---------- IO ---------- */
 
@@ -129,9 +107,9 @@ export function Macros() {
     setBusy(true);
     setErr(null);
     try {
-      const l = await invoke<MacroLimits>("macro_limits");
+      const l = await invoke<MacroLimits>(host ? "host_macro_limits" : "macro_limits");
       setLimits(l);
-      const m = await invoke<Macro[]>("get_macros");
+      const m = await invoke<Macro[]>(host ? "get_host_macros" : "get_macros");
       setRemote(m);
       setDraft(m.map(cloneMacro));
       // Names are host-side only — preserve through reads. Drop entries for
@@ -139,7 +117,8 @@ export function Macros() {
       setNames((prev) => {
         const next: Record<number, string> = {};
         for (const macro of m) {
-          if (prev[macro.macro_id]) next[macro.macro_id] = prev[macro.macro_id];
+          if (host) next[macro.macro_id] = macro.name ?? "";
+          else if (prev[macro.macro_id]) next[macro.macro_id] = prev[macro.macro_id];
         }
         return next;
       });
@@ -148,7 +127,7 @@ export function Macros() {
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [host]);
 
   // Guard against the React 19 + Strict-Mode double-invocation pattern as
   // well: if the effect is somehow scheduled twice in quick succession,
@@ -171,6 +150,8 @@ export function Macros() {
       e.preventDefault();
       e.stopPropagation();
       if (recordRef.current === null) return;
+      if (host && e.code === "Escape") { if (isPress) stopRecording(); return; }
+      if (host && (e.repeat || CODE_TO_HID[e.code] === undefined)) return;
       const now = performance.now();
       const delay = Math.min(
         65535,
@@ -188,13 +169,16 @@ export function Macros() {
 
     const down = (e: KeyboardEvent) => captureEvent(e, true);
     const up = (e: KeyboardEvent) => captureEvent(e, false);
+    const blur = () => { if (host) stopRecording(); };
+    window.addEventListener("blur", blur);
     window.addEventListener("keydown", down, true);
     window.addEventListener("keyup", up, true);
     return () => {
+      window.removeEventListener("blur", blur);
       window.removeEventListener("keydown", down, true);
       window.removeEventListener("keyup", up, true);
     };
-  }, [recording, selectedId]);
+  }, [recording, selectedId, host]);
 
   function stopRecording() {
     setRecording(false);
@@ -202,7 +186,16 @@ export function Macros() {
       recordRef.current = null;
       return;
     }
-    const captured = recordRef.current.actions;
+    let captured = recordRef.current.actions;
+    if (host) {
+      const held = new Set<number>();
+      captured = captured.filter(action => {
+        if (action.is_press) { if (held.has(action.key_code)) return false; held.add(action.key_code); return true; }
+        return held.delete(action.key_code);
+      });
+      if (captured.length) captured[0] = { ...captured[0], delay_ms: 0 };
+      captured.push(...Array.from(held).reverse().map(key_code => ({ key_code, delay_ms: 0, is_press: false, kind: "keyboard" as const })));
+    }
     recordRef.current = null;
     if (captured.length === 0) return;
     setDraft((d) =>
@@ -260,6 +253,7 @@ export function Macros() {
   }
 
   function deleteMacro(id: number) {
+    setNames(names => Object.fromEntries(Object.entries(names).filter(([key]) => Number(key) !== id)));
     setDraft((d) => d.filter((m) => m.macro_id !== id));
     if (selectedId === id) setSelectedId(null);
   }
@@ -268,6 +262,7 @@ export function Macros() {
 
   function setName(id: number, name: string) {
     setNames((n) => ({ ...n, [id]: name }));
+    if (host) setDraft(list => list.map(m => m.macro_id === id ? { ...m, name } : m));
   }
 
   /* ---------- save / discard ---------- */
@@ -275,8 +270,8 @@ export function Macros() {
   const dirty = useMemo(() => {
     if (remote === null) return false;
     if (remote.length !== draft.length) return true;
-    return JSON.stringify(stripNames(remote)) !== JSON.stringify(stripNames(draft));
-  }, [remote, draft]);
+    return host ? JSON.stringify(remote) !== JSON.stringify(draft) : JSON.stringify(stripNames(remote)) !== JSON.stringify(stripNames(draft));
+  }, [remote, draft, host]);
 
   async function save() {
     if (limits === null) return;
@@ -287,7 +282,7 @@ export function Macros() {
       const size = 4 + m.actions.length * 4;
       if (size > limits.byte_limit) {
         setErr(
-          `Macro #${m.macro_id} has ${m.actions.length} actions (${size} B) — exceeds ${limits.byte_limit} B device limit.`,
+          `Macro #${m.macro_id} has ${m.actions.length} actions (${size} B) — exceeds ${limits.byte_limit} B ${host ? "macro" : "device"} limit.`,
         );
         return;
       }
@@ -298,10 +293,10 @@ export function Macros() {
       // Wire format wants the strict list (id+actions). Names stay host-side.
       const payload = draft.map((m) => ({
         macro_id: m.macro_id,
-        name: null as string | null,
+        name: host ? names[m.macro_id] ?? m.name : null as string | null,
         actions: m.actions,
       }));
-      await invoke("set_macros", { macros: payload });
+      await invoke(host ? "save_host_macros" : "set_macros", { macros: payload });
       await refresh();
     } catch (e) {
       setErr(formatError(e));
@@ -313,6 +308,7 @@ export function Macros() {
   function discard() {
     if (remote === null) return;
     setDraft(remote.map(cloneMacro));
+    if (host) setNames(Object.fromEntries(remote.map(m => [m.macro_id, m.name ?? ""])));
   }
 
   /* --------------------------------------------------------- render -- */
@@ -321,7 +317,7 @@ export function Macros() {
     <>
       <PageHeader
         title="Macros"
-        description="Record key sequences once, replay them with a single key press. Up to 100 slots, 79 actions per macro."
+        description={host ? "Record and replay keyboard sequences on this Mac. Up to 100 macros, 512 events and 60 seconds each." : "Record key sequences once, replay them with a single key press. Up to 100 slots, 79 actions per macro."}
         action={
           <div className="flex gap-2">
             {dirty && (
@@ -329,19 +325,35 @@ export function Macros() {
                 Discard
               </Button>
             )}
-            <Button variant="primary" size="sm" onClick={save} disabled={busy || !dirty}>
-              {busy ? "Writing…" : dirty ? "Save to device" : "Saved"}
+            <Button variant="primary" size="sm" onClick={save} disabled={busy || recording || playback.running || !dirty}>
+              {busy ? "Saving…" : dirty ? host ? "Save on this Mac" : "Save to device" : "Saved"}
             </Button>
           </div>
         }
       />
 
-      <ErrorBanner>{err}</ErrorBanner>
+      <ErrorBanner>{err ?? (host ? playback.error : null)}</ErrorBanner>
+      {host && <Card title="Mac-side playback" className="mb-6">
+        <p className="mb-3 text-sm text-fg-2">Macros run while this app is open. Save a macro, then bind an AK820 key in Keymap & Knob. Press the trigger again to stop a running macro. Recording only listens inside this window.</p>
+        <div className="flex flex-wrap items-center gap-3">
+          <Badge tone={playback.accessibility ? "good" : "warn"}>{playback.accessibility ? "Accessibility enabled" : "Accessibility permission needed"}</Badge>
+          {!playback.accessibility && <Button size="sm" onClick={() => void invoke("open_keyboard_accessibility_settings").catch(e => setErr(formatError(e)))}>Open Accessibility settings</Button>}
+          <Button size="sm" onClick={() => void checkPlayback()}>Check permission</Button>
+          <Button size="sm" variant="primary" onClick={() => void play()} disabled={!playback.accessibility || dirty || selectedId === null || !selected?.actions.length || recording || playback.running}>Play in 3 seconds</Button>
+          <Button size="sm" variant="danger" onClick={() => void stopPlayback()} disabled={!playback.running}>Stop playback</Button>
+        </div>
+        {!playback.accessibility && <p className="mt-3 text-xs text-fg-3">macOS requires your approval before this app can generate keystrokes in other apps. Add AK820 Pro Modder in Privacy & Security → Accessibility, enable it, then check permission again.</p>}
+        {playback.accessibility && <p className="mt-3 text-xs text-fg-3">If you just enabled Accessibility and playback produces no text, quit and reopen this app so macOS refreshes its permission.</p>}
+        {playReceipt && <p role="status" className="mt-3 text-sm text-fg-1">{playReceipt}</p>}
+        <label className="mt-4 grid gap-2 text-sm text-fg-2">Playback test area
+          <textarea aria-label="Macro test area" placeholder="Click Play, then click here to test a saved macro" className="min-h-20 w-full" value={testText} onChange={e => setTestText(e.target.value)} />
+        </label>
+      </Card>}
 
       <div className="grid gap-6 lg:grid-cols-[280px_1fr]">
         {/* ----- slot list ----- */}
         <Card title="Slots" action={
-          <Button size="sm" variant="ghost" onClick={addMacroSlot} disabled={busy || limits === null}>
+          <Button size="sm" variant="ghost" onClick={addMacroSlot} disabled={busy || recording || playback.running || limits === null}>
             + New
           </Button>
         }>
@@ -357,6 +369,7 @@ export function Macros() {
                 return (
                   <li key={m.macro_id}>
                     <button
+                      disabled={recording || playback.running}
                       onClick={() => setSelectedId(m.macro_id)}
                       className={[
                         "flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm transition",
@@ -386,7 +399,7 @@ export function Macros() {
                 size="sm"
                 variant="danger"
                 onClick={() => deleteMacro(selected.macro_id)}
-                disabled={busy}
+                disabled={busy || recording || playback.running}
               >
                 Delete
               </Button>
@@ -403,8 +416,9 @@ export function Macros() {
               limits={limits}
               name={names[selected.macro_id] ?? ""}
               onNameChange={(n) => setName(selected.macro_id, n)}
+              host={host}
               recording={recording}
-              onStartRecording={() => setRecording(true)}
+              onStartRecording={() => { if (!playback.running) setRecording(true); }}
               onStopRecording={stopRecording}
               onClear={clearActions}
               onUpdateDelay={updateDelay}
@@ -420,6 +434,7 @@ export function Macros() {
 /* ------------------------------------------------------ child: editor -- */
 
 function MacroEditor({
+  host,
   macro,
   limits,
   name,
@@ -431,6 +446,7 @@ function MacroEditor({
   onUpdateDelay,
   onRemove,
 }: {
+  host: boolean;
   macro: Macro;
   limits: MacroLimits | null;
   name: string;
@@ -444,7 +460,7 @@ function MacroEditor({
 }) {
   const sizeBytes = macro.actions.length === 0 ? 0 : 4 + macro.actions.length * 4;
   const sizeBudget = limits?.byte_limit ?? 320;
-  const sizeRatio = Math.min(1, sizeBytes / sizeBudget);
+  const sizeRatio = Math.min(1, host ? macro.actions.length / (limits?.max_actions_per_macro ?? 512) : sizeBytes / sizeBudget);
 
   return (
     <div className="space-y-5">
@@ -490,7 +506,7 @@ function MacroEditor({
                 style={{ width: `${sizeRatio * 100}%` }}
               />
             </span>
-            <Mono>{sizeBytes}/{sizeBudget} B</Mono>
+            <Mono>{host ? `${macro.actions.length}/${limits?.max_actions_per_macro ?? 512} events` : `${sizeBytes}/${sizeBudget} B`}</Mono>
           </span>
         </div>
       </div>
@@ -500,7 +516,7 @@ function MacroEditor({
           Recording — every keypress in this window goes into the macro.
           <br />
           <span className="text-xs text-fg-3">
-            Inter-event delays are captured as wall-clock milliseconds. Click <b>Stop</b> when done.
+            Inter-event delays are captured as wall-clock milliseconds. Click <b>Stop</b> when done.{host && " Escape also stops recording; switching windows stops and releases held keys."}
           </span>
         </div>
       )}

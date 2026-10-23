@@ -5,11 +5,12 @@ import { Badge, Button, Card, ErrorBanner, Slider, Toggle } from "../components/
 import { PageHeader } from "../components/Layout";
 import { CustomLightingPaint } from "./CustomLightingPaint";
 import { formatError } from "../errors";
+import { type AppliedColourProfile, useColourEvent } from "../colour-profile-events";
 
 const ALL_DIRECTIONS: Direction[] = ["left", "down", "up", "right"];
 const APPLY_DEBOUNCE_MS = 80;
 
-export function Lighting() {
+export function Lighting({ legacy = false }: { legacy?: boolean }) {
   const [modes, setModes] = useState<LightingModeInfo[] | null>(null);
   const [cfg, setCfg] = useState<LightingConfig>({
     mode: "static",
@@ -51,7 +52,30 @@ export function Lighting() {
 
   const pendingTimer = useRef<number | null>(null);
   const inflight = useRef(false);
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(`ak820:lighting:${legacy ? "feature" : "output"}`) ?? "null");
+      if (saved && typeof saved.mode === "string" && /^[0-9a-f]{6}$/i.test(saved.color)) {
+        setCfg({ ...saved, secondary: legacy ? null : saved.secondary, effect_mode_type: legacy ? 0 : saved.effect_mode_type });
+      }
+    } catch { /* absent or invalid saved choices */ }
+    return () => {
+      if (pendingTimer.current !== null) window.clearTimeout(pendingTimer.current);
+      queued.current = null;
+    };
+  }, [legacy]);
   const queued = useRef<LightingConfig | null>(null);
+  useColourEvent<LightingConfig>("setup-global-lighting", config => {
+    if(!legacy)return;
+    if(pendingTimer.current!==null)window.clearTimeout(pendingTimer.current);
+    queued.current=null;setCfg(config);setLastApplied(new Date().toLocaleTimeString());
+  });
+  useColourEvent<AppliedColourProfile>("feature-rgb-applied", applied => {
+    if (!legacy) return;
+    if (pendingTimer.current !== null) window.clearTimeout(pendingTimer.current);
+    queued.current = null;
+    setCfg(previous => ({...previous, mode:"custom", brightness:applied.profile.brightness}));
+  });
 
   useEffect(() => {
     invoke<LightingModeInfo[]>("list_lighting_modes")
@@ -139,6 +163,7 @@ export function Lighting() {
     try {
       await invoke("apply_lighting", { config: next });
       setLastApplied(new Date().toLocaleTimeString());
+      try { window.localStorage.setItem(`ak820:lighting:${legacy ? "feature" : "output"}`, JSON.stringify(next)); } catch { /* storage unavailable */ }
     } catch (e) {
       setErr(formatError(e));
     } finally {
@@ -155,12 +180,17 @@ export function Lighting() {
     pendingTimer.current = window.setTimeout(() => {
       pendingTimer.current = null;
       void applyNow(next);
-    }, APPLY_DEBOUNCE_MS);
+    }, legacy ? 200 : APPLY_DEBOUNCE_MS);
   }
 
   function update<K extends keyof LightingConfig>(key: K, value: LightingConfig[K]) {
     const next = { ...cfg, [key]: value };
     setCfg(next);
+    if (legacy && next.mode === "custom") {
+      if (pendingTimer.current !== null) window.clearTimeout(pendingTimer.current);
+      queued.current = null;
+      return; // The paint editor applies mode + colour bank together.
+    }
     if (autoApply) scheduleApply(next);
   }
 
@@ -201,6 +231,7 @@ export function Lighting() {
       />
 
       <ErrorBanner>{err}</ErrorBanner>
+      {legacy && <p className="mb-5 text-sm text-fg-2">Choose custom to colour individual keys on your ANSI AK820, or use one of the 20 lighting effects.</p>}
 
       <div className="grid gap-6">
         <div
@@ -235,7 +266,7 @@ export function Lighting() {
         </Card>
 
         {isCustomMode ? (
-          <CustomLightingPaint inheritedConfig={cfg} />
+          <CustomLightingPaint inheritedConfig={cfg} legacy={legacy} />
         ) : (
         <>
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -260,7 +291,7 @@ export function Lighting() {
               <Badge tone="neutral">primary</Badge>
             </div>
 
-            <div className="mt-5 border-t border-line/60 pt-4">
+            {!legacy && <div className="mt-5 border-t border-line/60 pt-4">
               <Toggle
                 checked={hasSecondary}
                 onChange={(v) => update("secondary", v ? "000000" : null)}
@@ -288,7 +319,7 @@ export function Lighting() {
                   <Badge tone="neutral">secondary</Badge>
                 </div>
               )}
-            </div>
+            </div>}
           </Card>
 
           <Card
@@ -318,6 +349,7 @@ export function Lighting() {
             </div>
 
             <div className="mt-5 border-t border-line/60 pt-4">
+              {legacy ? <Toggle checked={cfg.color_mode !== 0} onChange={(on) => update("color_mode", on ? 1 : 0)}>Rainbow colours</Toggle> : <>
               <p className="mb-2 text-xs uppercase tracking-wider text-fg-2">
                 colorMode <span className="ml-1 normal-case text-fg-3">(0 = mono, &gt;0 cycles per mode)</span>
               </p>
@@ -331,6 +363,7 @@ export function Lighting() {
                 }
                 className="w-24 font-mono"
               />
+              </>}
             </div>
           </Card>
         </div>
@@ -353,7 +386,7 @@ export function Lighting() {
           * controls to find it, and the Alpha badge + amber warning
           * makes its status unambiguous when they get there.
           */}
-        <Card
+        {!legacy && <Card
           title={
             <span className="inline-flex items-center gap-2">
               <span>Audio-reactive</span>
@@ -414,7 +447,7 @@ export function Lighting() {
               {audioReactive ? "Streaming" : "Off"}
             </Toggle>
           </div>
-        </Card>
+        </Card>}
       </div>
     </>
   );

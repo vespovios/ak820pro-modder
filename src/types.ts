@@ -15,6 +15,7 @@ export interface ProbeReport {
   interface: number;
   product: string | null;
   firmware_version: string | null;
+  legacy: boolean;
 }
 
 export interface LightingModeInfo {
