@@ -120,6 +120,12 @@ IMAGE_CFG packet and both bytes of its block count. Knob navigation between
 the stable clock/status/custom pages is separate from animation playback.
 The original imported profile needs no image or timing changes.
 
+The corrected release app was installed in Applications and applied that
+unchanged imported setup successfully. The user confirmed the MTA image stayed
+visible and key colours were correct. All 84 library tests passed (one native
+integration test ignored); formatting, frontend/native builds, app signature
+and DMG checksum checks also passed.
+
 Vendor package and executable hashes are recorded in [PER-KEY-RGB.md](PER-KEY-RGB.md).
 The Windows executable was analyzed, not run or redistributed.
 

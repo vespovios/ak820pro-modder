@@ -155,5 +155,9 @@ TFT destination-slot correction (23 October 2026):
   hold-test setup removed; original Current setup entry remains.
 - Backup: /tmp/ak820-before-tft-slot-fix/. Protocol comparison evidence and
   validation logs: /tmp/ak820-screen-diagnosis/.
-- Final installed-app physical confirmation requested; current imported profile
-  disables Mac remaps/macros, so no macro replay test or permission change made.
+- User confirmed the fixed installed app keeps MTA visible and key colours
+  correct after applying the original imported profile. Both login/background
+  options retained; window closed and process remains running.
+- Current imported profile disables Mac remaps/macros, so no macro replay test
+  or permission change made. A changed local signature may require renewed
+  Accessibility approval before using another profile's Mac macros.
