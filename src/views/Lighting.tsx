@@ -1,3 +1,4 @@
+import { useCapabilities } from "../capabilities";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Direction, LightingConfig, LightingModeInfo } from "../types";
@@ -10,6 +11,8 @@ const ALL_DIRECTIONS: Direction[] = ["left", "down", "up", "right"];
 const APPLY_DEBOUNCE_MS = 80;
 
 export function Lighting() {
+  const caps = useCapabilities();
+  const legacy = caps?.protocol === "legacy_feature";
   const [modes, setModes] = useState<LightingModeInfo[] | null>(null);
   const [cfg, setCfg] = useState<LightingConfig>({
     mode: "static",
@@ -23,7 +26,11 @@ export function Lighting() {
   });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [autoApply, setAutoApply] = useState(true);
+  const [autoApplyChoice, setAutoApply] = useState(true);
+  // Family B saves every lighting write to flash: dragging a slider or the
+  // colour picker would write dozens of times, so only Apply writes there.
+  // Unknown counts as family B: caps is null while a board re-enumerates.
+  const autoApply = autoApplyChoice && caps?.protocol === "web_output";
   const [lastApplied, setLastApplied] = useState<string | null>(null);
 
   // Audio-reactive lighting (macOS only) — currently **alpha**: the
@@ -184,14 +191,18 @@ export function Lighting() {
         description={
           isCustomMode
             ? "Per-key custom RGB — click any key on the layout below to paint it."
-            : "Per-keyboard global effects. Changes apply immediately when auto-apply is on."
+            : legacy
+              ? "Pick an effect and press Apply. This keyboard saves every change to its memory, so nothing is sent while you adjust."
+              : "Per-keyboard global effects. Changes apply immediately when auto-apply is on."
         }
         action={
           isCustomMode ? null : (
             <div className="flex items-center gap-4">
-              <Toggle checked={autoApply} onChange={setAutoApply}>
-                Auto-apply
-              </Toggle>
+              {!legacy && (
+                <Toggle checked={autoApply} onChange={setAutoApply}>
+                  Auto-apply
+                </Toggle>
+              )}
               <Button variant="primary" onClick={() => void applyNow(cfg)} disabled={busy}>
                 {busy ? "Sending…" : "Apply"}
               </Button>
@@ -201,6 +212,7 @@ export function Lighting() {
       />
 
       <ErrorBanner>{err}</ErrorBanner>
+      {legacy && <p className="mb-5 text-sm text-fg-2">This revision supports the built-in effects and per-key painting (custom, ANSI layout). Audio-reactive lighting would write to the keyboard's flash many times a second and is unavailable.</p>}
 
       <div className="grid gap-6">
         <div
@@ -217,7 +229,7 @@ export function Lighting() {
           }
         >
           <div className="flex flex-wrap gap-2">
-            {modes.map((m) => {
+            {modes.filter((m) => !legacy || caps?.per_key_rgb || m.name !== "custom").map((m) => {
               const isActive = m.name === cfg.mode;
               return (
                 <Button
@@ -260,7 +272,7 @@ export function Lighting() {
               <Badge tone="neutral">primary</Badge>
             </div>
 
-            <div className="mt-5 border-t border-line/60 pt-4">
+            {!legacy && <div className="mt-5 border-t border-line/60 pt-4">
               <Toggle
                 checked={hasSecondary}
                 onChange={(v) => update("secondary", v ? "000000" : null)}
@@ -288,7 +300,7 @@ export function Lighting() {
                   <Badge tone="neutral">secondary</Badge>
                 </div>
               )}
-            </div>
+            </div>}
           </Card>
 
           <Card
@@ -324,10 +336,10 @@ export function Lighting() {
               <input
                 type="number"
                 min={0}
-                max={255}
+                max={legacy ? 1 : 255}
                 value={cfg.color_mode}
                 onChange={(e) =>
-                  update("color_mode", Math.max(0, Math.min(255, Number(e.target.value) || 0)))
+                  update("color_mode", Math.max(0, Math.min(legacy ? 1 : 255, Number(e.target.value) || 0)))
                 }
                 className="w-24 font-mono"
               />
@@ -353,7 +365,7 @@ export function Lighting() {
           * controls to find it, and the Alpha badge + amber warning
           * makes its status unambiguous when they get there.
           */}
-        <Card
+        {!legacy && <Card
           title={
             <span className="inline-flex items-center gap-2">
               <span>Audio-reactive</span>
@@ -414,7 +426,7 @@ export function Lighting() {
               {audioReactive ? "Streaming" : "Off"}
             </Toggle>
           </div>
-        </Card>
+        </Card>}
       </div>
     </>
   );
