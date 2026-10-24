@@ -497,7 +497,7 @@ async fn save_automations(app: AppHandle, list: Vec<Automation>) -> Result<(), A
         .app_data_dir()
         .map_err(|e| AppError::Protocol(format!("app_data_dir: {e}")))?;
     let list_clone = list.clone();
-    tokio::task::spawn_blocking(move || automations::save(dir, &list_clone))
+    tokio::task::spawn_blocking(move || automations::save(&automations::lock(), dir, &list_clone))
         .await
         .map_err(|e| AppError::Protocol(format!("join: {e}")))?
         .map_err(AppError::Protocol)?;
@@ -524,6 +524,7 @@ async fn assign_automation_marker(
     let chosen = {
         let dir = dir.clone();
         tokio::task::spawn_blocking(move || -> Result<u8, String> {
+            let lock = automations::lock();
             let mut list = automations::load(dir.clone())?;
             let pos = list
                 .iter()
@@ -546,7 +547,7 @@ async fn assign_automation_marker(
             };
             list[pos].marker_hid = Some(chosen);
             list[pos].updated_at = unix_millis();
-            automations::save(dir, &list)?;
+            automations::save(&lock, dir, &list)?;
             Ok(chosen)
         })
         .await
@@ -569,12 +570,13 @@ async fn unassign_automation_marker(app: AppHandle, id: u64) -> Result<(), AppEr
         .map_err(|e| AppError::Protocol(format!("app_data_dir: {e}")))?;
     let dir_clone = dir.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let lock = automations::lock();
         let mut list = automations::load(dir_clone.clone())?;
         if let Some(pos) = list.iter().position(|a| a.id == id) {
             if list[pos].marker_hid.is_some() {
                 list[pos].marker_hid = None;
                 list[pos].updated_at = unix_millis();
-                automations::save(dir_clone, &list)?;
+                automations::save(&lock, dir_clone, &list)?;
             }
         }
         Ok(())
@@ -748,6 +750,7 @@ async fn apply_preset(
                 .map_err(|e| AppError::Protocol(format!("app_data_dir: {e}")))?;
             let dir_clone = dir.clone();
             let added = tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
+                let lock = automations::lock();
                 let mut list = automations::load(dir_clone.clone())?;
                 let mut added = 0usize;
                 let mut skipped = 0usize;
@@ -769,7 +772,7 @@ async fn apply_preset(
                     });
                     added += 1;
                 }
-                automations::save(dir_clone, &list)?;
+                automations::save(&lock, dir_clone, &list)?;
                 Ok((added, skipped))
             })
             .await
@@ -922,61 +925,59 @@ async fn audio_reactive_status() -> Result<bool, AppError> {
 
 /* --------------------------------------------------- iCloud Sync (Phase 6) --
  *
- * Backend is a thin transport: detect the iCloud Drive root, copy a file
- * each way, report mtime. The frontend keeps the "enabled" flag (in
- * localStorage) and orchestrates *when* to push or pull — on app start
- * (pull), after every save (push), or via the manual "Sync Now" button.
+ * The backend merges the automations library with iCloud Drive per entry
+ * (see `icloud_sync.rs`). The frontend keeps the "enabled" flag (in
+ * localStorage) and decides *when* to sync: on app start (pull), after
+ * every save (push), or via "Sync now" in the SyncCard.
  *
  * Three commands:
- *   icloud_sync_status   - cheap probe: is iCloud Drive present + does
- *                           the remote automations file exist?
- *   icloud_sync_push     - copy local automations.json → iCloud
- *   icloud_sync_pull     - copy iCloud automations.json → local *only*
- *                           if the iCloud copy is strictly newer
+ *   icloud_sync_status   - cheap probe: is iCloud Drive present, does the
+ *                           remote file exist, which conflicts are open?
+ *   icloud_sync_push     - merge local and iCloud, write both sides
+ *   icloud_sync_pull     - the same merge; optionally settles one conflict
+ *                           (`resolve: { id, keep: "local" | "remote" }`)
  *
- * `push` and `pull` both return the resulting remote mtime (or `None`
- * on pull when nothing was newer) so the UI can render "last synced: …".
+ * Push and pull are the same operation since the merge is two-way; the
+ * names stay because the call sites mean "after a save" and "on start /
+ * on demand". Both return a `SyncReport` (changes + open conflicts).
  */
 
 #[tauri::command]
-async fn icloud_sync_status() -> Result<icloud_sync::SyncStatus, AppError> {
-    // Spawn-blocking because `std::fs::metadata` does I/O and we don't
-    // want to stall the tokio worker even briefly on a slow disk.
-    tokio::task::spawn_blocking(icloud_sync::status)
+async fn icloud_sync_status(app: AppHandle) -> Result<icloud_sync::SyncStatus, AppError> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Protocol(format!("app_data_dir: {e}")))?;
+    // Spawn-blocking because the probe reads files and we don't want to
+    // stall the tokio worker even briefly on a slow disk.
+    tokio::task::spawn_blocking(move || icloud_sync::status(&dir))
         .await
         .map_err(|e| AppError::Protocol(format!("join: {e}")))
 }
 
 #[tauri::command]
-async fn icloud_sync_push(app: AppHandle) -> Result<u64, AppError> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| AppError::Protocol(format!("app_data_dir: {e}")))?;
-    let local_path = automations::storage_path(dir);
-    tokio::task::spawn_blocking(move || icloud_sync::push_automations(&local_path))
-        .await
-        .map_err(|e| AppError::Protocol(format!("join: {e}")))?
+async fn icloud_sync_push(app: AppHandle) -> Result<icloud_sync::SyncReport, AppError> {
+    icloud_sync_pull(app, None).await
 }
 
 #[tauri::command]
-async fn icloud_sync_pull(app: AppHandle) -> Result<Option<u64>, AppError> {
+async fn icloud_sync_pull(
+    app: AppHandle,
+    resolve: Option<icloud_sync::Resolution>,
+) -> Result<icloud_sync::SyncReport, AppError> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| AppError::Protocol(format!("app_data_dir: {e}")))?;
-    let local_path = automations::storage_path(dir);
-    let result =
-        tokio::task::spawn_blocking(move || icloud_sync::pull_automations_if_newer(&local_path))
-            .await
-            .map_err(|e| AppError::Protocol(format!("join: {e}")))??;
-    // After a successful pull we need to re-register the global
-    // shortcuts because the marker bindings may have changed. Same
-    // call as `save_automations` runs after a write.
-    if result.is_some() {
+    let report = tokio::task::spawn_blocking(move || icloud_sync::sync(&dir, resolve))
+        .await
+        .map_err(|e| AppError::Protocol(format!("join: {e}")))??;
+    // Entries from iCloud may carry other marker bindings, so re-register
+    // the global shortcuts. Same call as `save_automations` runs.
+    if report.local_changed {
         refresh_automation_shortcuts(&app).map_err(AppError::Protocol)?;
     }
-    Ok(result)
+    Ok(report)
 }
 
 /* ------------------------------------------------- TFT presets (Phase 5c) --

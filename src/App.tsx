@@ -8,7 +8,7 @@ import { Macros } from "./views/Macros";
 import { Presets } from "./views/Presets";
 import { System } from "./views/System";
 import { Tft } from "./views/Tft";
-import { ICLOUD_SYNC_ENABLED_KEY } from "./components/SyncCard";
+import { ICLOUD_SYNC_ENABLED_KEY, trackStartupSync } from "./components/SyncCard";
 import {
   Layout,
   Plug,
@@ -55,12 +55,10 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("connect");
   const [probe, setProbe] = useState<ProbeReport | null>(null);
 
-  // iCloud auto-pull on app start. Fire-and-forget — if the iCloud
-  // copy of automations.json is newer than the local one, the backend
-  // overwrites the local file before any view requests its contents.
-  // The frontend never sees the in-flight state because all
-  // automation-consuming views fetch on mount, and this effect runs
-  // before any view-specific effect.
+  // iCloud auto-sync on app start. The backend merges the iCloud copy of
+  // the automations library into the local file (per entry; conflicts
+  // wait in System → iCloud Sync). Not awaited here; saves in the
+  // Automations view wait for it via `startupSync`.
   useEffect(() => {
     let enabled = false;
     try {
@@ -69,10 +67,9 @@ export default function App() {
       /* private-browsing — ignore */
     }
     if (!enabled) return;
-    void invoke("icloud_sync_pull").catch(() => {
-      // Pull failure on startup shouldn't bubble — user sees the
-      // error inline if they open the System → Sync card.
-    });
+    // A failure on startup is swallowed by `trackStartupSync` — the user
+    // sees the error inline if they open the System → Sync card.
+    trackStartupSync(invoke("icloud_sync_pull"));
   }, []);
 
   useEffect(() => {
